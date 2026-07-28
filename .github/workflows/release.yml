@@ -81,24 +81,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
-        run: gh release create "v$VERSION" --draft --generate-notes --target "$GITHUB_SHA" --title "v$VERSION"
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "GitHub release v$VERSION already exists; reusing it"
+          else
+            gh release create "v$VERSION" --draft --generate-notes --target "$GITHUB_SHA" --title "v$VERSION"
+          fi
 
       - name: Publish macro crate
         if: ${{ !inputs.dry_run }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p almostsql-macros
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          INDEX_URL="https://index.crates.io/al/mo/almostsql-macros"
+          if curl --fail --silent --show-error "$INDEX_URL" |
+            grep -Fq "\"vers\":\"$VERSION\""; then
+            echo "almostsql-macros $VERSION is already published; skipping"
+          else
+            cargo publish -p almostsql-macros
+          fi
 
       - name: Wait for macro crate index propagation
         if: ${{ !inputs.dry_run }}
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          for attempt in {1..30}; do
-            if cargo search almostsql-macros --limit 1 | grep -F "almostsql-macros = \"$VERSION\""; then
+          set -euo pipefail
+          INDEX_URL="https://index.crates.io/al/mo/almostsql-macros"
+          for attempt in {1..60}; do
+            if curl --fail --silent --show-error \
+              --header "Cache-Control: no-cache" "$INDEX_URL" |
+              grep -Fq "\"vers\":\"$VERSION\""; then
+              echo "almostsql-macros $VERSION is available in the Cargo sparse index"
               exit 0
             fi
-            echo "Waiting for almostsql-macros $VERSION to reach the crates.io index ($attempt/30)"
+            echo "Waiting for almostsql-macros $VERSION to reach the Cargo sparse index ($attempt/60)"
             sleep 10
           done
           exit 1
@@ -107,9 +126,17 @@ jobs:
         if: ${{ !inputs.dry_run }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ inputs.version }}
         run: |
-          cargo publish -p almostsql --dry-run
-          cargo publish -p almostsql
+          set -euo pipefail
+          INDEX_URL="https://index.crates.io/al/mo/almostsql"
+          if curl --fail --silent --show-error "$INDEX_URL" |
+            grep -Fq "\"vers\":\"$VERSION\""; then
+            echo "almostsql $VERSION is already published; skipping"
+          else
+            cargo publish -p almostsql --dry-run
+            cargo publish -p almostsql
+          fi
 
       - name: Publish GitHub release
         if: ${{ !inputs.dry_run }}
