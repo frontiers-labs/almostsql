@@ -1,0 +1,36 @@
+[workspace]
+members = ["almostsql-macros"]
+resolver = "3"
+
+[package]
+name = "almostsql"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A minimalist async SQL query builder and migration library for SQLite and Postgres"
+license = "MIT"
+repository = "https://github.com/frontiers-labs/almostsql"
+homepage = "https://github.com/frontiers-labs/almostsql"
+readme = "README.md"
+authors = ["Frontiers Labs"]
+keywords = ["sql", "sqlite", "postgres", "query-builder", "migrations"]
+categories = ["database"]
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:sqlite", "dep:sqlite-vec"]
+postgres = ["dep:postgres"]
+
+[dependencies]
+almostsql-macros = { version = "0.1.0", path = "almostsql-macros" }
+bytes = "1"
+futures = "0.3.32"
+postgres = { version = "0.19.12", features = ["with-uuid-1"], optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+sqlite = { version = "0.37.0", features = ["bundled"], optional = true }
+sqlite-vec = { version = "0.1.9", optional = true }
+sqlparser = "0.61.0"
+uuid = { version = "1.23.1", features = ["v4", "v7"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.1", features = ["macros", "rt"] }
