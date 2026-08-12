@@ -178,3 +178,57 @@ async fn dropped_transaction_discards_typed_writes() {
     let rows = items::select().all(&db).await.expect("select");
     assert!(rows.is_empty());
 }
+
+#[tokio::test]
+async fn typed_prepared_select_binds_params_at_execution() {
+    let db = pool_with_schema().await;
+    let mut batch = items::insert_batch();
+    for i in 0..50_i64 {
+        batch = batch.add(
+            items::insert()
+                .id(Uuid::new_v4())
+                .name(format!("row-{i}"))
+                .rank(i),
+        );
+    }
+    batch.execute(&db).await.expect("seed");
+
+    let by_rank = items::select()
+        .where_(items::rank.eq_param())
+        .prepare(&db)
+        .await
+        .expect("prepare");
+
+    for i in [0_i64, 7, 42] {
+        let row = by_rank.one(almostsql::params![i]).await.expect("execute");
+        assert_eq!(row.rank, i);
+        assert_eq!(row.name, format!("row-{i}"));
+    }
+
+    // Wrong arity is rejected before reaching the database.
+    assert!(by_rank.all(almostsql::params![1_i64, 2_i64]).await.is_err());
+    assert!(by_rank.all(almostsql::params![]).await.is_err());
+
+    // Fixed and hole parameters mix; holes bind in order of appearance.
+    let range = items::select()
+        .where_(items::rank.ge_param().and(items::rank.lt(40_i64)))
+        .prepare(&db)
+        .await
+        .expect("prepare range");
+    let rows = range.all(almostsql::params![35_i64]).await.expect("range");
+    assert_eq!(rows.len(), 5);
+}
+
+#[tokio::test]
+async fn unprepared_execution_of_param_holes_is_rejected() {
+    let db = pool_with_schema().await;
+    let error = match items::select()
+        .where_(items::rank.eq_param())
+        .all(&db)
+        .await
+    {
+        Ok(_) => panic!("must not run with unbound parameters"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unbound"));
+}

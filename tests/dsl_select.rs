@@ -42,7 +42,7 @@ async fn select_with_where_and_limit_via_dsl() {
     // Build a typed SELECT using the DSL: WHERE name = 'Alice' ORDER BY age ASC LIMIT 1
     let mut query = Select::<Users>::new("users").where_(NAME.eq("Alice"));
     query.order_by(AGE, true);
-    let (sql, params) = query.limit(1).to_sql();
+    let (sql, params) = query.limit(1).to_sql().unwrap();
 
     let res = pool
         .query_with_params(&sql, params)

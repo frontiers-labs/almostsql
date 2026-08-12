@@ -635,7 +635,7 @@ impl Table {
 
                     /// Fetch all rows for this select
                     pub async fn all(self, db: &impl ::almostsql::Executor) -> Result<Vec<Row>, Box<dyn std::error::Error + Send + Sync>> {
-                        let (sql, params) = self.0.to_sql();
+                        let (sql, params) = self.0.to_sql()?;
                         let res = db.query_with_params(&sql, params).await?;
                         let mut out = Vec::with_capacity(res.row_count());
                         for mut r in res.into_rows() {
@@ -649,6 +649,43 @@ impl Table {
                     pub async fn one(self, db: &impl ::almostsql::Executor) -> Result<Row, Box<dyn std::error::Error + Send + Sync>> {
                         let mut rows = self.limit(1).all(db).await?;
                         rows.pop().ok_or_else(|| "query returned 0 rows".into())
+                    }
+
+                    /// Precompile this query. Comparisons built with the
+                    /// `*_param()` column methods become bind parameters
+                    /// supplied at execution time, in order of appearance.
+                    pub async fn prepare(self, db: &::almostsql::ConnectionPool) -> Result<PreparedSelect, Box<dyn std::error::Error + Send + Sync>> {
+                        Ok(PreparedSelect(self.0.prepare(db).await?))
+                    }
+                }
+
+                /// A precompiled, typed SELECT for this table. Execute with
+                /// the values for the query's `*_param()` holes.
+                pub struct PreparedSelect(::almostsql::PreparedSelect<Table>);
+
+                impl PreparedSelect {
+                    pub fn sql(&self) -> &str {
+                        self.0.sql()
+                    }
+
+                    /// Execute and decode every row.
+                    pub async fn all(&self, args: Vec<::almostsql::Value>) -> Result<Vec<Row>, Box<dyn std::error::Error + Send + Sync>> {
+                        let res = self.0.query(args).await?;
+                        let mut out = Vec::with_capacity(res.row_count());
+                        for mut r in res.into_rows() {
+                            let row = Row { #( #row_inits, )* };
+                            out.push(row);
+                        }
+                        Ok(out)
+                    }
+
+                    /// Execute and decode the first row, or error on none.
+                    pub async fn one(&self, args: Vec<::almostsql::Value>) -> Result<Row, Box<dyn std::error::Error + Send + Sync>> {
+                        let mut rows = self.all(args).await?;
+                        if rows.is_empty() {
+                            return Err("query returned 0 rows".into());
+                        }
+                        Ok(rows.swap_remove(0))
                     }
                 }
 
@@ -678,7 +715,7 @@ impl Table {
                     }
 
                     pub async fn all(self, db: &impl ::almostsql::Executor) -> Result<Vec<<C as ::almostsql::SelectList<Table>>::Out>, Box<dyn std::error::Error + Send + Sync>> {
-                        let (sql, params) = self.0.to_sql();
+                        let (sql, params) = self.0.to_sql()?;
                         let res = db.query_with_params(&sql, params).await?;
                         let mut out = Vec::with_capacity(res.row_count());
                         let colnames = self.0.names_slice().to_vec();

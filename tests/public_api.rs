@@ -73,7 +73,8 @@ fn builders_preserve_parameter_order_and_require_explicit_bulk_writes() {
         .where_(predicate)
         .limit(5)
         .offset(2)
-        .to_sql();
+        .to_sql()
+        .unwrap();
     assert_eq!(
         sql,
         "SELECT * FROM users WHERE ((id > ?) AND (name != ?)) LIMIT ? OFFSET ?"

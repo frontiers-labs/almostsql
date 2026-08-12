@@ -100,6 +100,18 @@ let by_id = db.prepare("SELECT name FROM users WHERE id = ?").await?;
 let user = by_id.query(vec![Value::Uuid(id)]).await?;
 ```
 
+The typed select builder can be precompiled too: `*_param()` comparisons
+become bind parameters supplied at execution time (in order of appearance),
+and results decode into the table's typed rows:
+
+```rust,ignore
+let adults_by_age = users::select()
+    .where_(users::age.ge_param())
+    .prepare(&db)
+    .await?;
+let rows = adults_by_age.all(almostsql::params![18_i64]).await?;
+```
+
 **Batched inserts.** `insert_batch` writes many rows per statement (chunked to
 respect bind-parameter limits, atomic across chunks):
 

@@ -473,6 +473,55 @@ impl PreparedQuery {
     }
 }
 
+/// A precompiled statement built from a typed builder: a [`PreparedQuery`]
+/// plus the builder's fixed parameter values and the positions of its
+/// `*_param()` holes. Executing it merges the caller's arguments into the
+/// holes, in order of appearance.
+pub struct PreparedStatement {
+    prepared: PreparedQuery,
+    slots: Vec<crate::dsl::ParamSlot>,
+    holes: usize,
+}
+
+impl PreparedStatement {
+    pub(crate) fn new(prepared: PreparedQuery, slots: Vec<crate::dsl::ParamSlot>) -> Self {
+        let holes = slots
+            .iter()
+            .filter(|slot| matches!(slot, crate::dsl::ParamSlot::Hole))
+            .count();
+        Self {
+            prepared,
+            slots,
+            holes,
+        }
+    }
+
+    pub fn sql(&self) -> &str {
+        self.prepared.sql()
+    }
+
+    pub(crate) async fn query(&self, args: Vec<Value>) -> Result<QueryResult, Error> {
+        if args.len() != self.holes {
+            return Err(Error::InvalidQuery(format!(
+                "prepared query takes {} parameter(s), got {}",
+                self.holes,
+                args.len()
+            )));
+        }
+        let mut merged = Vec::with_capacity(self.slots.len());
+        let mut args = args.into_iter();
+        for slot in &self.slots {
+            match slot {
+                crate::dsl::ParamSlot::Fixed(value) => merged.push(value.clone()),
+                crate::dsl::ParamSlot::Hole => {
+                    merged.push(args.next().expect("hole count was checked"))
+                }
+            }
+        }
+        self.prepared.query(merged).await
+    }
+}
+
 impl Backend {
     pub(crate) fn builder(&self) -> SQLBuilder {
         match self {

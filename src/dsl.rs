@@ -203,6 +203,40 @@ impl<T, Tab> Column<T, Tab> {
         }
     }
 
+    /// Compare against a bind parameter supplied when the prepared query
+    /// executes, instead of a fixed value.
+    pub fn eq_param(&self) -> Expr<Tab> {
+        self.compare_param("=")
+    }
+
+    pub fn ne_param(&self) -> Expr<Tab> {
+        self.compare_param("!=")
+    }
+
+    pub fn gt_param(&self) -> Expr<Tab> {
+        self.compare_param(">")
+    }
+
+    pub fn ge_param(&self) -> Expr<Tab> {
+        self.compare_param(">=")
+    }
+
+    pub fn lt_param(&self) -> Expr<Tab> {
+        self.compare_param("<")
+    }
+
+    pub fn le_param(&self) -> Expr<Tab> {
+        self.compare_param("<=")
+    }
+
+    fn compare_param(&self, op: &'static str) -> Expr<Tab> {
+        Expr::CompareParam {
+            column: self.name,
+            op,
+            _p: PhantomData,
+        }
+    }
+
     pub fn is_null(&self) -> Expr<Tab> {
         Expr::<Tab>::IsNull {
             column: self.name,
@@ -275,16 +309,21 @@ impl<Tab> VectorSearch<Tab> {
         self.query.clone()
     }
 
-    pub(crate) fn append_where(&self, sql: &mut String, params: &mut Vec<Value>) {
+    pub(crate) fn append_where(
+        &self,
+        sql: &mut String,
+        params: &mut Vec<Value>,
+    ) -> Result<(), String> {
         if let Some(expr) = &self.where_clause {
             sql.push_str(" WHERE ");
-            expr.to_sql(sql, params);
+            expr.to_sql_values(sql, params)?;
             sql.push_str(" AND ");
         } else {
             sql.push_str(" WHERE ");
         }
         sql.push_str(self.vector_column);
         sql.push_str(" IS NOT NULL");
+        Ok(())
     }
 
     pub(crate) fn append_limit(&self, sql: &mut String, params: &mut Vec<Value>) {
@@ -295,12 +334,27 @@ impl<Tab> VectorSearch<Tab> {
     }
 }
 
+/// One position in a statement's parameter list: either a value fixed when
+/// the builder was constructed, or a hole (from a `*_param()` comparison) to
+/// be filled at execution time.
+pub(crate) enum ParamSlot {
+    Fixed(Value),
+    Hole,
+}
+
 /// A typed boolean/compare expression bound to a single table
 pub enum Expr<Tab> {
     Compare {
         column: &'static str,
         op: &'static str,
         value: Value,
+        _p: PhantomData<Tab>,
+    },
+    /// A comparison whose right-hand side is a bind parameter supplied at
+    /// execution time (see [`Column::eq_param`] and friends).
+    CompareParam {
+        column: &'static str,
+        op: &'static str,
         _p: PhantomData<Tab>,
     },
     IsNull {
@@ -326,7 +380,7 @@ impl<Tab> Expr<Tab> {
         Expr::Or(Box::new(self), Box::new(other), PhantomData)
     }
 
-    fn to_sql(&self, out_sql: &mut String, out_params: &mut Vec<Value>) {
+    fn to_sql(&self, out_sql: &mut String, out_params: &mut Vec<ParamSlot>) {
         match self {
             Expr::Compare {
                 column, op, value, ..
@@ -336,7 +390,15 @@ impl<Tab> Expr<Tab> {
                 out_sql.push(' ');
                 out_sql.push_str(op);
                 out_sql.push_str(" ?)");
-                out_params.push(value.clone());
+                out_params.push(ParamSlot::Fixed(value.clone()));
+            }
+            Expr::CompareParam { column, op, .. } => {
+                out_sql.push('(');
+                out_sql.push_str(column);
+                out_sql.push(' ');
+                out_sql.push_str(op);
+                out_sql.push_str(" ?)");
+                out_params.push(ParamSlot::Hole);
             }
             Expr::And(a, b, _) => {
                 out_sql.push('(');
@@ -371,6 +433,30 @@ impl<Tab> Expr<Tab> {
                 out_sql.push_str(" IS NOT NULL)");
             }
         }
+    }
+
+    /// Like `to_sql`, but requires every parameter to be fixed. Errors when
+    /// the expression contains `*_param()` holes, which only a prepared
+    /// statement can bind.
+    fn to_sql_values(
+        &self,
+        out_sql: &mut String,
+        out_params: &mut Vec<Value>,
+    ) -> Result<(), String> {
+        let mut slots = Vec::new();
+        self.to_sql(out_sql, &mut slots);
+        for slot in slots {
+            match slot {
+                ParamSlot::Fixed(value) => out_params.push(value),
+                ParamSlot::Hole => {
+                    return Err(
+                        "query has unbound parameters from *_param(); use prepare() to bind them"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -423,8 +509,14 @@ impl<Tab> Select<Tab> {
         self
     }
 
-    /// Build SQL string with placeholders and ordered params
-    pub fn to_sql(&self) -> (String, Vec<Value>) {
+    /// Build SQL string with placeholders and ordered params. Errors when the
+    /// query contains `*_param()` holes; those require [`Select::prepare`].
+    pub fn to_sql(&self) -> Result<(String, Vec<Value>), String> {
+        let (sql, slots) = self.to_sql_slots();
+        Ok((sql, fixed_values(slots)?))
+    }
+
+    pub(crate) fn to_sql_slots(&self) -> (String, Vec<ParamSlot>) {
         let mut sql = String::new();
         sql.push_str("SELECT * FROM ");
         sql.push_str(self.table);
@@ -440,14 +532,61 @@ impl<Tab> Select<Tab> {
         }
         if let Some(n) = self.limit {
             sql.push_str(" LIMIT ?");
-            params.push(Value::Integer(n as i64));
+            params.push(ParamSlot::Fixed(Value::Integer(n as i64)));
         }
         if let Some(n) = self.offset {
             sql.push_str(" OFFSET ?");
-            params.push(Value::Integer(n as i64));
+            params.push(ParamSlot::Fixed(Value::Integer(n as i64)));
         }
         (sql, params)
     }
+
+    /// Precompile this query. `*_param()` comparisons become bind parameters
+    /// supplied at execution time, in the order they appear in the query.
+    pub async fn prepare(
+        &self,
+        db: &crate::ConnectionPool,
+    ) -> Result<PreparedSelect<Tab>, crate::Error> {
+        let (sql, slots) = self.to_sql_slots();
+        let prepared = db.prepare(&sql).await?;
+        Ok(PreparedSelect {
+            inner: crate::connection_pool::PreparedStatement::new(prepared, slots),
+            _p: PhantomData,
+        })
+    }
+}
+
+/// A precompiled, typed SELECT. Execute with the values for the query's
+/// `*_param()` holes, in order of appearance.
+pub struct PreparedSelect<Tab> {
+    inner: crate::connection_pool::PreparedStatement,
+    _p: PhantomData<Tab>,
+}
+
+impl<Tab> PreparedSelect<Tab> {
+    pub fn sql(&self) -> &str {
+        self.inner.sql()
+    }
+
+    pub async fn query(&self, args: Vec<Value>) -> Result<crate::QueryResult, crate::Error> {
+        self.inner.query(args).await
+    }
+}
+
+pub(crate) fn fixed_values(slots: Vec<ParamSlot>) -> Result<Vec<Value>, String> {
+    let mut values = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            ParamSlot::Fixed(value) => values.push(value),
+            ParamSlot::Hole => {
+                return Err(
+                    "query has unbound parameters from *_param(); use prepare() to bind them"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(values)
 }
 
 /// A single-table UPDATE builder that emits SQL and parameters.
@@ -513,7 +652,7 @@ impl<Tab> Update<Tab> {
         let mut params = self.set_vals.clone();
         if let Some(expr) = &self.where_clause {
             sql.push_str(" WHERE ");
-            expr.to_sql(&mut sql, &mut params);
+            expr.to_sql_values(&mut sql, &mut params)?;
         }
         Ok((sql, params))
     }
@@ -560,7 +699,7 @@ impl<Tab> Delete<Tab> {
         let mut params = Vec::new();
         if let Some(expr) = &self.where_clause {
             sql.push_str(" WHERE ");
-            expr.to_sql(&mut sql, &mut params);
+            expr.to_sql_values(&mut sql, &mut params)?;
         }
         Ok((sql, params))
     }
@@ -616,16 +755,16 @@ impl<Tab, C: SelectList<Tab>> SelectCols<Tab, C> {
         self
     }
 
-    pub fn to_sql(&self) -> (String, Vec<Value>) {
+    pub fn to_sql(&self) -> Result<(String, Vec<Value>), String> {
         let mut sql = String::new();
         sql.push_str("SELECT ");
         sql.push_str(&self.names.join(", "));
         sql.push_str(" FROM ");
         sql.push_str(self.base.table);
-        let mut params = Vec::new();
+        let mut slots = Vec::new();
         if let Some(expr) = &self.base.where_clause {
             sql.push_str(" WHERE ");
-            expr.to_sql(&mut sql, &mut params);
+            expr.to_sql(&mut sql, &mut slots);
         }
         if let Some((col, asc)) = &self.base.order_by {
             sql.push_str(" ORDER BY ");
@@ -634,13 +773,13 @@ impl<Tab, C: SelectList<Tab>> SelectCols<Tab, C> {
         }
         if let Some(n) = self.base.limit {
             sql.push_str(" LIMIT ?");
-            params.push(Value::Integer(n as i64));
+            slots.push(ParamSlot::Fixed(Value::Integer(n as i64)));
         }
         if let Some(n) = self.base.offset {
             sql.push_str(" OFFSET ?");
-            params.push(Value::Integer(n as i64));
+            slots.push(ParamSlot::Fixed(Value::Integer(n as i64)));
         }
-        (sql, params)
+        Ok((sql, fixed_values(slots)?))
     }
 
     pub fn names_slice(&self) -> &[&'static str] {

@@ -12,10 +12,10 @@ mod sql_builder;
 mod sqlite;
 
 pub use batch::BatchInsert;
-pub use connection_pool::{ConnectionPool, Executor, Migrator, PreparedQuery};
+pub use connection_pool::{ConnectionPool, Executor, Migrator, PreparedQuery, PreparedStatement};
 pub use dsl::{
-    Column, ColumnInput, Delete, Expr, IntoValue, Select, SelectCols, SelectList, Update,
-    VectorSearch, vector_search,
+    Column, ColumnInput, Delete, Expr, IntoValue, PreparedSelect, Select, SelectCols, SelectList,
+    Update, VectorSearch, vector_search,
 };
 pub use error::Error;
 pub use migration::{
@@ -27,3 +27,13 @@ pub use query::{Columns, DecodeError, FromValue, QueryResult, Row, Transaction, 
 
 // Re-export proc macros for type-safe schema generation
 pub use almostsql_macros::migrations;
+
+/// Build a `Vec<Value>` of bind parameters from Rust values:
+/// `params![id, "name", 42_i64]`.
+#[macro_export]
+macro_rules! params {
+    () => { Vec::<$crate::Value>::new() };
+    ($($value:expr),+ $(,)?) => {
+        vec![$($crate::IntoValue::into_value($value)),+]
+    };
+}

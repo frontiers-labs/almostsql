@@ -392,7 +392,9 @@ impl SqliteBuilder {
             search.table()
         );
         let mut params = vec![search.query()];
-        search.append_where(&mut sql, &mut params);
+        search
+            .append_where(&mut sql, &mut params)
+            .map_err(crate::sql_builder::SQLError::Custom)?;
         sql.push_str(" ORDER BY distance ASC");
         search.append_limit(&mut sql, &mut params);
         Ok((sql, params))
