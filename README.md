@@ -139,6 +139,16 @@ hold several connections, so independent queries run concurrently. In-memory
 SQLite keeps a single connection, since each `:memory:` connection would be a
 separate database.
 
+**Direct execution.** SQLite queries execute inline on the calling task
+against a checked-out pooled connection — no worker threads or channel
+round-trips, so a cached point query costs on the order of a microsecond.
+The trade-off is that the statement runs on the executor thread: very large
+scans, or a write waiting out the 5s busy timeout under contention, occupy
+that thread for their duration. With `postgres-tokio`, callers await the
+client directly while a single background thread drives socket I/O; the
+synchronous `postgres` driver keeps dedicated worker threads so its blocking
+network calls stay off the executor.
+
 ## Transactions
 
 A transaction checks a dedicated connection out of the pool. Issue its

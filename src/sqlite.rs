@@ -1,24 +1,54 @@
+//! SQLite backend with direct, inline execution.
+//!
+//! SQLite is an in-process library, so queries run directly on the caller's
+//! task against a connection checked out of a [`SlotPool`] — no worker
+//! threads, no channel round-trips. A point query costs one free-list pop,
+//! the statement execution itself, and one push.
+//!
+//! The trade-off: execution happens on the executor thread. Statements are
+//! usually microseconds, but very large scans or a contended write (busy
+//! timeout) will occupy the thread for their duration.
+
 use std::sync::{Arc, Once};
-use std::thread;
 
 use crate::error::Error;
 use crate::migration::{AlterTable, Command, SqlType};
-use crate::pool::{
-    CacheSlots, Request, RequestQueue, STATEMENT_CACHE_CAPACITY, STREAM_CHUNK_ROWS, is_ddl,
-};
+use crate::pool::{CacheSlots, STATEMENT_CACHE_CAPACITY, SlotGuard, SlotPool, is_ddl};
 use crate::query::{Columns, QueryResult, Row, Value};
 use crate::sql_builder::SQLBuilder;
 use ::sqlite::{self, Connection, State, Statement, Value as SqliteValue};
-use async_channel::Receiver;
 
 #[derive(Clone)]
 pub struct SqliteBackend {
-    queue: RequestQueue,
+    pool: SlotPool<SqliteConnection>,
 }
 
 pub struct SqliteBuilder;
 
 static VEC_EXTENSION: Once = Once::new();
+
+/// One pooled SQLite connection plus its prepared-statement cache.
+///
+/// The cache holds `Statement<'static>` values whose real lifetime is tied to
+/// `connection`. That is sound because the connection is boxed (its heap
+/// address never changes when the slot moves) and `cache` is declared before
+/// `connection`, so statements are finalized before the connection closes.
+pub(crate) struct SqliteConnection {
+    cache: CacheSlots<CachedStatement>,
+    connection: Box<Connection>,
+}
+
+// SAFETY: the slot is only ever accessed by one thread at a time — it moves
+// through the pool channel and is used exclusively through a `SlotGuard`.
+// SQLite itself is compiled in serialized threading mode (the bundled
+// default), so a connection may be used from different threads serially. The
+// `Rc`s inside cached `Statement`s never escape the slot, so their non-atomic
+// reference counts are only touched by the thread currently holding the slot.
+unsafe impl Send for SqliteConnection {}
+
+struct CachedStatement {
+    statement: Statement<'static>,
+}
 
 impl SqliteBackend {
     pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -29,29 +59,59 @@ impl SqliteBackend {
         // Every connection to a `:memory:` path opens a distinct database, so
         // in-memory pools must stay at one connection.
         let memory = path.contains(":memory:") || path.contains("mode=memory");
-        let workers = if memory {
+        let connections = if memory {
             1
         } else {
-            thread::available_parallelism()
+            std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
                 .min(4)
         };
 
-        let (queue, request_rx) = RequestQueue::new_shared();
-
-        // Open the first connection synchronously so a bad path fails here
-        // rather than on the first query.
-        spawn_worker(path, request_rx.clone(), memory, true)?;
-        for _ in 1..workers {
-            spawn_worker(path, request_rx.clone(), memory, false)?;
+        let pool = SlotPool::new();
+        for _ in 0..connections {
+            pool.put(SqliteConnection::open(path, memory)?);
         }
 
-        Ok(Self { queue })
+        Ok(Self { pool })
     }
 
-    pub(crate) fn queue(&self) -> &RequestQueue {
-        &self.queue
+    pub(crate) async fn query(
+        &self,
+        sql: Arc<str>,
+        params: Vec<Value>,
+    ) -> Result<QueryResult, Error> {
+        let mut slot = self.pool.acquire().await?;
+        slot.execute(&sql, &params)
+    }
+
+    pub(crate) async fn prepare_only(&self, sql: Arc<str>) -> Result<(), Error> {
+        let mut slot = self.pool.acquire().await?;
+        slot.ensure_cached(&sql).map(|_| ())
+    }
+
+    pub(crate) async fn query_stream(
+        &self,
+        sql: Arc<str>,
+        params: Vec<Value>,
+    ) -> Result<crate::pool::RowStream, Error> {
+        let mut guard = self.pool.acquire().await?;
+        let (columns, column_count) = guard.start_streaming(&sql, &params)?;
+        Ok(crate::pool::RowStream::from_sqlite(SqliteRowStream {
+            guard,
+            sql,
+            columns,
+            column_count,
+            done: false,
+        }))
+    }
+
+    pub(crate) async fn begin(&self) -> Result<SqliteTransaction, Error> {
+        let mut guard = self.pool.acquire().await?;
+        guard.execute(&Arc::from("BEGIN;"), &[])?;
+        Ok(SqliteTransaction {
+            guard: futures::lock::Mutex::new(guard),
+        })
     }
 
     pub fn builder(&self) -> SQLBuilder {
@@ -59,151 +119,169 @@ impl SqliteBackend {
     }
 }
 
-fn spawn_worker(
-    path: &str,
-    request_rx: Receiver<Request>,
-    memory: bool,
-    fail_fast: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = path.to_string();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+/// A transaction's exclusively-held SQLite connection.
+pub(crate) struct SqliteTransaction {
+    guard: futures::lock::Mutex<SlotGuard<SqliteConnection>>,
+}
 
-    thread::Builder::new()
-        .name("almostsql-sqlite-worker".to_string())
-        .spawn(move || {
-            let connection = match open_connection(&path, memory) {
-                Ok(connection) => {
-                    let _ = ready_tx.send(Ok(()));
-                    connection
-                }
+impl SqliteTransaction {
+    pub(crate) async fn query(
+        &self,
+        sql: Arc<str>,
+        params: Vec<Value>,
+    ) -> Result<QueryResult, Error> {
+        self.guard.lock().await.execute(&sql, &params)
+    }
+
+    /// Roll back without consuming; used from `Transaction`'s `Drop`. The
+    /// error (if any) is ignored — SQLite aborts the transaction itself on
+    /// most failures, and the slot returns to the pool either way.
+    pub(crate) fn rollback_blocking(&self) {
+        if let Some(mut guard) = self.guard.try_lock() {
+            let _ = guard.execute(&Arc::from("ROLLBACK;"), &[]);
+        }
+    }
+}
+
+impl SqliteConnection {
+    fn open(path: &str, memory: bool) -> Result<Self, sqlite::Error> {
+        let mut connection = Connection::open(path)?;
+        if !memory {
+            // WAL lets one writer and many readers proceed concurrently; the
+            // busy timeout resolves writer contention between pool connections.
+            connection.execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+            connection.set_busy_timeout(5_000)?;
+        }
+        Ok(Self {
+            cache: CacheSlots::new(STATEMENT_CACHE_CAPACITY),
+            connection: Box::new(connection),
+        })
+    }
+
+    fn ensure_cached(&mut self, sql: &Arc<str>) -> Result<&mut CachedStatement, Error> {
+        if self.cache.get_mut(sql).is_none() {
+            let statement = self
+                .connection
+                .prepare(&**sql)
+                .map_err(|e| Error::Backend(e.to_string()))?;
+            // SAFETY: erases the borrow of `self.connection`. The connection
+            // is boxed and outlives the cache (see the struct invariant), and
+            // the statement never leaves this slot.
+            let statement =
+                unsafe { std::mem::transmute::<Statement<'_>, Statement<'static>>(statement) };
+            self.cache
+                .insert(sql.clone(), CachedStatement { statement });
+        }
+        Ok(self.cache.get_mut(sql).expect("statement was just cached"))
+    }
+
+    fn execute(&mut self, sql: &Arc<str>, params: &[Value]) -> Result<QueryResult, Error> {
+        if is_ddl(sql) {
+            // `execute` runs the whole string through sqlite3_exec, so multi-
+            // statement DDL (as raw migrations often are) works. Cached
+            // statements may reference the old schema afterwards; drop them.
+            let result = self
+                .connection
+                .execute(&**sql)
+                .map(|_| QueryResult::new(Vec::new(), self.connection.change_count()))
+                .map_err(|e| Error::Backend(e.to_string()));
+            self.cache.clear();
+            return result;
+        }
+
+        self.ensure_cached(sql)?;
+        // Split field borrows: the statement borrows `cache`, the change
+        // counter reads `connection`.
+        let connection = &*self.connection;
+        let cached = self.cache.get_mut(sql).expect("statement was just cached");
+        let statement = &mut cached.statement;
+        let result = run_statement(statement, params, || connection.change_count());
+        let _ = statement.reset();
+        result
+    }
+
+    fn start_streaming(
+        &mut self,
+        sql: &Arc<str>,
+        params: &[Value],
+    ) -> Result<(Arc<Columns>, usize), Error> {
+        if is_ddl(sql) {
+            return Err(Error::InvalidQuery(
+                "cannot stream a schema-changing statement".into(),
+            ));
+        }
+        let cached = self.ensure_cached(sql)?;
+        let statement = &mut cached.statement;
+        bind_params(statement, params)?;
+        let column_count = statement.column_count();
+        let columns = Arc::new(Columns::new(statement.column_names().to_vec()));
+        Ok((columns, column_count))
+    }
+}
+
+/// Incremental row stream over a checked-out connection: each `next_row`
+/// steps the cached statement once, so rows are produced lazily and the
+/// connection returns to the pool when the stream is dropped.
+pub(crate) struct SqliteRowStream {
+    guard: SlotGuard<SqliteConnection>,
+    sql: Arc<str>,
+    columns: Arc<Columns>,
+    column_count: usize,
+    done: bool,
+}
+
+impl SqliteRowStream {
+    pub(crate) fn next_row(&mut self) -> Option<Result<Row, Error>> {
+        if self.done {
+            return None;
+        }
+        let sql = self.sql.clone();
+        let Some(cached) = self.guard.cache.get_mut(&sql) else {
+            self.done = true;
+            return Some(Err(Error::InvalidQuery(
+                "streamed statement was evicted mid-iteration".into(),
+            )));
+        };
+        let statement = &mut cached.statement;
+        match step(statement) {
+            Ok(State::Row) => match read_row(statement, &self.columns, self.column_count) {
+                Ok(row) => Some(Ok(row)),
                 Err(error) => {
-                    let _ = ready_tx.send(Err(error.to_string()));
-                    return;
+                    self.finish();
+                    Some(Err(error))
                 }
-            };
-            worker_loop(&connection, request_rx);
-        })?;
-
-    if fail_fast {
-        ready_rx
-            .recv()
-            .map_err(|_| "sqlite worker stopped before opening".to_string())??;
-    }
-    Ok(())
-}
-
-fn open_connection(path: &str, memory: bool) -> Result<Connection, sqlite::Error> {
-    let mut connection = Connection::open(path)?;
-    if !memory {
-        // WAL lets one writer and many readers proceed concurrently; the busy
-        // timeout resolves writer contention between pool connections.
-        connection.execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-        connection.set_busy_timeout(5_000)?;
-    }
-    Ok(connection)
-}
-
-struct CachedStatement<'l> {
-    statement: Statement<'l>,
-}
-
-fn worker_loop(connection: &Connection, request_rx: Receiver<Request>) {
-    let mut cache: CacheSlots<CachedStatement<'_>> = CacheSlots::new(STATEMENT_CACHE_CAPACITY);
-
-    while let Ok(request) = request_rx.recv_blocking() {
-        match request {
-            Request::Checkout { response } => {
-                let (private_tx, private_rx) = async_channel::unbounded();
-                if response.send(private_tx).is_err() {
-                    continue;
-                }
-                while let Ok(request) = private_rx.recv_blocking() {
-                    match request {
-                        Request::Release => break,
-                        Request::Checkout { .. } => {}
-                        other => dispatch(connection, &mut cache, other),
-                    }
-                }
+            },
+            Ok(State::Done) => {
+                self.finish();
+                None
             }
-            Request::Release => {}
-            other => dispatch(connection, &mut cache, other),
+            Err(error) => {
+                self.finish();
+                Some(Err(error))
+            }
         }
+    }
+
+    fn finish(&mut self) {
+        if let Some(cached) = self.guard.cache.get_mut(&self.sql) {
+            let _ = cached.statement.reset();
+        }
+        self.done = true;
     }
 }
 
-fn dispatch<'l>(
-    connection: &'l Connection,
-    cache: &mut CacheSlots<CachedStatement<'l>>,
-    request: Request,
-) {
-    match request {
-        Request::Query {
-            sql,
-            params,
-            response,
-        } => {
-            let result = execute(connection, cache, &sql, &params);
-            let _ = response.send(result);
+impl Drop for SqliteRowStream {
+    fn drop(&mut self) {
+        if !self.done {
+            self.finish();
         }
-        Request::Prepare { sql, response } => {
-            let result = ensure_cached(connection, cache, &sql).map(|_| ());
-            let _ = response.send(result);
-        }
-        Request::QueryStream {
-            sql,
-            params,
-            chunks,
-        } => {
-            execute_stream(connection, cache, &sql, &params, &chunks);
-        }
-        Request::Checkout { .. } | Request::Release => {}
     }
-}
-
-fn ensure_cached<'l, 'c>(
-    connection: &'l Connection,
-    cache: &'c mut CacheSlots<CachedStatement<'l>>,
-    sql: &Arc<str>,
-) -> Result<&'c mut CachedStatement<'l>, Error> {
-    // A get followed by an insert on miss would borrow the cache twice in
-    // ways the borrow checker rejects, so probe by key first.
-    if cache.get_mut(sql).is_none() {
-        let statement = connection
-            .prepare(&**sql)
-            .map_err(|e| Error::Backend(e.to_string()))?;
-        cache.insert(sql.clone(), CachedStatement { statement });
-    }
-    Ok(cache.get_mut(sql).expect("statement was just cached"))
-}
-
-fn execute<'l>(
-    connection: &'l Connection,
-    cache: &mut CacheSlots<CachedStatement<'l>>,
-    sql: &Arc<str>,
-    params: &[Value],
-) -> Result<QueryResult, Error> {
-    if is_ddl(sql) {
-        // `execute` runs the whole string through sqlite3_exec, so multi-
-        // statement DDL (as raw migrations often are) works. Cached statements
-        // may reference the old schema afterwards; drop them.
-        let result = connection
-            .execute(&**sql)
-            .map(|_| QueryResult::new(Vec::new(), connection.change_count()))
-            .map_err(|e| Error::Backend(e.to_string()));
-        cache.clear();
-        return result;
-    }
-
-    let cached = ensure_cached(connection, cache, sql)?;
-    let result = run_statement(connection, &mut cached.statement, params);
-    let _ = cached.statement.reset();
-    result
 }
 
 fn run_statement(
-    connection: &Connection,
-    statement: &mut Statement<'_>,
+    statement: &mut Statement<'static>,
     params: &[Value],
+    change_count: impl Fn() -> usize,
 ) -> Result<QueryResult, Error> {
     bind_params(statement, params)?;
 
@@ -212,7 +290,7 @@ fn run_statement(
         // No result columns: step to completion and report the real change
         // count instead of materializing anything.
         while let State::Row = step(statement)? {}
-        return Ok(QueryResult::new(Vec::new(), connection.change_count()));
+        return Ok(QueryResult::new(Vec::new(), change_count()));
     }
 
     let columns = Arc::new(Columns::new(statement.column_names().to_vec()));
@@ -222,56 +300,6 @@ fn run_statement(
     }
     let affected_rows = rows.len();
     Ok(QueryResult::new(rows, affected_rows))
-}
-
-fn execute_stream<'l>(
-    connection: &'l Connection,
-    cache: &mut CacheSlots<CachedStatement<'l>>,
-    sql: &Arc<str>,
-    params: &[Value],
-    chunks: &async_channel::Sender<Result<Vec<Row>, Error>>,
-) {
-    if is_ddl(sql) {
-        let _ = chunks.send_blocking(Err(Error::InvalidQuery(
-            "cannot stream a schema-changing statement".into(),
-        )));
-        return;
-    }
-
-    let cached = match ensure_cached(connection, cache, sql) {
-        Ok(cached) => cached,
-        Err(error) => {
-            let _ = chunks.send_blocking(Err(error));
-            return;
-        }
-    };
-    let statement = &mut cached.statement;
-
-    let result = (|| -> Result<(), Error> {
-        bind_params(statement, params)?;
-        let column_count = statement.column_count();
-        let columns = Arc::new(Columns::new(statement.column_names().to_vec()));
-        let mut chunk = Vec::with_capacity(STREAM_CHUNK_ROWS);
-        while let State::Row = step(statement)? {
-            chunk.push(read_row(statement, &columns, column_count)?);
-            if chunk.len() >= STREAM_CHUNK_ROWS {
-                let full = std::mem::replace(&mut chunk, Vec::with_capacity(STREAM_CHUNK_ROWS));
-                if chunks.send_blocking(Ok(full)).is_err() {
-                    // The consumer dropped the stream; stop reading.
-                    return Ok(());
-                }
-            }
-        }
-        if !chunk.is_empty() {
-            let _ = chunks.send_blocking(Ok(chunk));
-        }
-        Ok(())
-    })();
-
-    if let Err(error) = result {
-        let _ = chunks.send_blocking(Err(error));
-    }
-    let _ = statement.reset();
 }
 
 fn step(statement: &mut Statement<'_>) -> Result<State, Error> {

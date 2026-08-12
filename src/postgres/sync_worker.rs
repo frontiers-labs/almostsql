@@ -8,12 +8,72 @@ use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::ToSql;
 use postgres::{Client, NoTls};
 
-use super::{CachedStatement, postgres_params, postgres_placeholders, postgres_row};
+use super::{
+    CachedStatement, POSTGRES_WORKERS, postgres_params, postgres_placeholders, postgres_row,
+};
 use crate::error::Error;
-use crate::pool::{CacheSlots, Request, STATEMENT_CACHE_CAPACITY, STREAM_CHUNK_ROWS, is_ddl};
+use crate::pool::{
+    CacheSlots, Request, RequestQueue, RowStream, STATEMENT_CACHE_CAPACITY, STREAM_CHUNK_ROWS,
+    is_ddl,
+};
 use crate::query::{QueryResult, Row, Value};
+use crate::sql_builder::SQLBuilder;
 
-pub(super) fn spawn_worker(
+#[derive(Clone)]
+pub struct PostgresBackend {
+    queue: RequestQueue,
+}
+
+impl PostgresBackend {
+    pub fn new(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (queue, request_rx) = RequestQueue::new_shared();
+
+        // The first worker connects synchronously so a bad URL fails here
+        // rather than on the first query.
+        spawn_worker(url, request_rx.clone(), true)?;
+        for _ in 1..POSTGRES_WORKERS {
+            spawn_worker(url, request_rx.clone(), false)?;
+        }
+
+        Ok(Self { queue })
+    }
+
+    pub(crate) async fn query(
+        &self,
+        sql: std::sync::Arc<str>,
+        params: Vec<Value>,
+    ) -> Result<QueryResult, Error> {
+        self.queue.query(sql, params).await
+    }
+
+    pub(crate) async fn prepare_only(&self, sql: std::sync::Arc<str>) -> Result<(), Error> {
+        self.queue.prepare(sql).await
+    }
+
+    pub(crate) async fn query_stream(
+        &self,
+        sql: std::sync::Arc<str>,
+        params: Vec<Value>,
+    ) -> Result<RowStream, Error> {
+        self.queue.query_stream(sql, params).await
+    }
+
+    /// Check a worker out and open a transaction on its connection. The
+    /// returned private queue pins all further statements to that worker.
+    pub(crate) async fn begin(&self) -> Result<RequestQueue, Error> {
+        let private = self.queue.checkout().await?;
+        private
+            .query(std::sync::Arc::from("BEGIN;"), Vec::new())
+            .await?;
+        Ok(private)
+    }
+
+    pub fn builder(&self) -> SQLBuilder {
+        SQLBuilder::Postgres(super::PostgresBuilder {})
+    }
+}
+
+fn spawn_worker(
     url: &str,
     request_rx: Receiver<Request>,
     fail_fast: bool,

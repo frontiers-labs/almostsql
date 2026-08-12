@@ -232,3 +232,29 @@ async fn unprepared_execution_of_param_holes_is_rejected() {
     };
     assert!(error.to_string().contains("unbound"));
 }
+
+#[tokio::test]
+async fn concurrent_queries_share_the_pool() {
+    let db = pool_with_schema().await;
+    let mut batch = items::insert_batch();
+    for i in 0..100_i64 {
+        batch = batch.add(items::insert().id(Uuid::new_v4()).name("c").rank(i));
+    }
+    batch.execute(&db).await.expect("seed");
+
+    let queries = (0..16).map(|i| {
+        let db = db.clone();
+        async move {
+            items::select()
+                .where_(items::rank.ge(i as i64))
+                .all(&db)
+                .await
+                .expect("concurrent select")
+                .len()
+        }
+    });
+    let counts = futures::future::join_all(queries).await;
+    for (i, count) in counts.into_iter().enumerate() {
+        assert_eq!(count, 100 - i);
+    }
+}

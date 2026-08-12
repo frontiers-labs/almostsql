@@ -111,3 +111,44 @@ async fn postgres_prepared_transactions_batch_and_streaming() {
         .await
         .expect("cleanup");
 }
+
+#[tokio::test]
+async fn postgres_concurrent_queries_share_the_pool() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping: ALMOSTSQL_PG_TEST_URL not set");
+        return;
+    };
+    let db = ConnectionPool::new(&url).expect("pool");
+    fresh_table(&db, "pg_conc_items").await;
+    for i in 0..50_i64 {
+        db.query_with_params(
+            "INSERT INTO pg_conc_items (id, name) VALUES (?, ?)",
+            vec![Value::Integer(i), Value::Text("c".into())],
+        )
+        .await
+        .expect("seed");
+    }
+
+    let queries = (0..16).map(|i| {
+        let db = db.clone();
+        async move {
+            db.query_with_params(
+                "SELECT COUNT(*) AS n FROM pg_conc_items WHERE id >= ?",
+                vec![Value::Integer(i)],
+            )
+            .await
+            .expect("concurrent select")
+            .rows()[0]
+                .get_int("n")
+                .unwrap()
+        }
+    });
+    let counts = futures::future::join_all(queries).await;
+    for (i, count) in counts.into_iter().enumerate() {
+        assert_eq!(count, 50 - i as i64);
+    }
+
+    db.query("DROP TABLE pg_conc_items;")
+        .await
+        .expect("cleanup");
+}

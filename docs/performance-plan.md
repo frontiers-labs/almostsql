@@ -1,13 +1,17 @@
 # almostsql performance improvement plan
 
-> **Status: implemented.** All four phases landed (plus phase 0). Measured on
-> the shared micro-benchmark (in-memory SQLite, release build): 10k-row scans
-> ~1.75× faster, batched inserts ~21× faster per row than single-row inserts,
-> UPDATE/DELETE affected-row counts fixed, and `cargo bench` now tracks the
-> baselines. The Postgres backend supports two drivers behind one worker
-> protocol: the synchronous `postgres` crate (feature `postgres`) and
-> `tokio-postgres` on per-connection current-thread runtimes (feature
-> `postgres-tokio`), both with statement caching and four pooled connections.
+> **Status: implemented, including the follow-up direct-execution redesign.**
+> All four phases landed (plus phase 0), and the worker-thread request channel
+> was subsequently removed wherever the driver allows direct execution:
+> SQLite queries run inline on the caller's task against a checked-out
+> connection slot, and `tokio-postgres` clients are awaited directly with one
+> background thread driving socket I/O. Only the synchronous `postgres`
+> driver keeps worker threads (its blocking network calls must stay off the
+> executor). Measured on the shared micro-benchmark (in-memory SQLite,
+> release build, vs. the original implementation): point queries ~39× faster
+> (~41µs → ~1.2µs), 10k single-statement inserts ~24× faster, 10k-row scans
+> ~2× faster. UPDATE/DELETE affected-row counts were also fixed, and
+> `cargo bench` tracks the baselines.
 
 This document describes the current performance problems in almostsql and a
 phased plan to fix them. The headline gap — no way to precompile a query — is

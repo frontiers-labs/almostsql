@@ -12,7 +12,9 @@ mod sql_builder;
 mod sqlite;
 
 pub use batch::BatchInsert;
-pub use connection_pool::{ConnectionPool, Executor, Migrator, PreparedQuery, PreparedStatement};
+pub use connection_pool::{
+    ConnectionPool, Executor, Migrator, PreparedQuery, PreparedStatement, Transaction,
+};
 pub use dsl::{
     Column, ColumnInput, Delete, Expr, IntoValue, PreparedSelect, Select, SelectCols, SelectList,
     Update, VectorSearch, vector_search,
@@ -23,7 +25,7 @@ pub use migration::{
     Table,
 };
 pub use pool::RowStream;
-pub use query::{Columns, DecodeError, FromValue, QueryResult, Row, Transaction, Value};
+pub use query::{Columns, DecodeError, FromValue, QueryResult, Row, Value};
 
 // Re-export proc macros for type-safe schema generation
 pub use almostsql_macros::migrations;

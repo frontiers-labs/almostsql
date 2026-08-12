@@ -4,9 +4,6 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::error::Error;
-use crate::pool::{Request, RequestQueue};
-
 /// Represents a SQL value of any supported type
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -191,72 +188,6 @@ impl QueryResult {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
-    }
-}
-
-/// A database transaction pinned to one checked-out connection.
-///
-/// Queries issued through the transaction run on that connection; queries
-/// issued through the [`ConnectionPool`](crate::ConnectionPool) while a
-/// transaction is open run on *other* connections and do not see uncommitted
-/// changes. Dropping the transaction without calling [`commit`](Self::commit)
-/// rolls it back.
-pub struct Transaction {
-    queue: RequestQueue,
-    finished: bool,
-}
-
-impl Transaction {
-    pub(crate) fn new(queue: RequestQueue) -> Self {
-        Self {
-            queue,
-            finished: false,
-        }
-    }
-
-    /// Execute a raw SQL query on the transaction's connection.
-    pub async fn query(&self, query: &str) -> Result<QueryResult, Error> {
-        self.queue.query(Arc::from(query), Vec::new()).await
-    }
-
-    /// Execute a parameterized statement on the transaction's connection.
-    pub async fn query_with_params(
-        &self,
-        query: &str,
-        params: Vec<Value>,
-    ) -> Result<QueryResult, Error> {
-        self.queue.query(Arc::from(query), params).await
-    }
-
-    pub async fn commit(mut self) -> Result<(), Error> {
-        self.query("COMMIT;").await?;
-        self.finish();
-        Ok(())
-    }
-
-    pub async fn rollback(mut self) -> Result<(), Error> {
-        self.query("ROLLBACK;").await?;
-        self.finish();
-        Ok(())
-    }
-
-    fn finish(&mut self) {
-        self.finished = true;
-        let _ = self.queue.sender().try_send(Request::Release);
-    }
-}
-
-impl Drop for Transaction {
-    fn drop(&mut self) {
-        if !self.finished {
-            let (response, _) = futures::channel::oneshot::channel();
-            let _ = self.queue.sender().try_send(Request::Query {
-                sql: Arc::from("ROLLBACK;"),
-                params: Vec::new(),
-                response,
-            });
-            let _ = self.queue.sender().try_send(Request::Release);
-        }
     }
 }
 

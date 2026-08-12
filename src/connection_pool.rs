@@ -1,8 +1,8 @@
 use crate::error::Error;
-use crate::pool::{RequestQueue, RowStream};
+use crate::pool::RowStream;
 #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
 use crate::postgres::PostgresBackend;
-use crate::query::{QueryResult, Transaction, Value};
+use crate::query::{QueryResult, Value};
 use crate::sql_builder::SQLBuilder;
 #[cfg(feature = "sqlite")]
 use crate::sqlite::SqliteBackend;
@@ -72,10 +72,6 @@ impl ConnectionPool {
         Ok(ConnectionPool {
             backend: Arc::new(backend),
         })
-    }
-
-    fn queue(&self) -> &RequestQueue {
-        self.backend.queue()
     }
 
     /// Apply a single unnamed migration history. Equivalent to building a
@@ -219,7 +215,7 @@ impl ConnectionPool {
 
     /// Execute a raw SQL query asynchronously
     pub async fn query(&self, query: &str) -> Result<QueryResult, Error> {
-        self.queue().query(Arc::from(query), Vec::new()).await
+        self.backend.query(Arc::from(query), Vec::new()).await
     }
 
     /// Execute a parameterized statement asynchronously. Statements are
@@ -230,7 +226,7 @@ impl ConnectionPool {
         query: &str,
         params: Vec<Value>,
     ) -> Result<QueryResult, Error> {
-        self.queue().query(Arc::from(query), params).await
+        self.backend.query(Arc::from(query), params).await
     }
 
     /// Precompile a statement and return a reusable handle. The statement is
@@ -239,18 +235,18 @@ impl ConnectionPool {
     /// generation and re-preparation entirely.
     pub async fn prepare(&self, query: &str) -> Result<PreparedQuery, Error> {
         let sql: Arc<str> = Arc::from(query);
-        self.queue().prepare(sql.clone()).await?;
+        self.backend.prepare_only(sql.clone()).await?;
         Ok(PreparedQuery {
-            queue: self.queue().clone(),
+            backend: self.backend.clone(),
             sql,
         })
     }
 
     /// Execute a query and stream its rows without materializing the whole
-    /// result set. Rows arrive in bounded chunks from the connection worker;
-    /// dropping the stream cancels the remaining work.
+    /// result set. Rows are produced incrementally from a checked-out
+    /// connection; dropping the stream releases it and abandons the rest.
     pub async fn query_stream(&self, query: &str, params: Vec<Value>) -> Result<RowStream, Error> {
-        self.queue().query_stream(Arc::from(query), params).await
+        self.backend.query_stream(Arc::from(query), params).await
     }
 
     pub async fn vector_search<Tab>(
@@ -413,10 +409,111 @@ impl ConnectionPool {
     /// [`Transaction`]; queries made on the pool meanwhile run on other
     /// connections and do not join the transaction.
     pub async fn transaction(&self) -> Result<Transaction, Error> {
-        let queue = self.queue().checkout().await?;
-        let transaction = Transaction::new(queue);
-        transaction.query("BEGIN;").await?;
-        Ok(transaction)
+        let inner = match &*self.backend {
+            #[cfg(all(feature = "postgres", not(feature = "postgres-tokio")))]
+            Backend::Postgres(postgres) => TransactionInner::PgQueue(postgres.begin().await?),
+            #[cfg(feature = "postgres-tokio")]
+            Backend::Postgres(postgres) => TransactionInner::Postgres(postgres.begin().await?),
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(sqlite) => TransactionInner::Sqlite(sqlite.begin().await?),
+        };
+        Ok(Transaction {
+            inner,
+            finished: false,
+        })
+    }
+}
+
+/// A database transaction pinned to one connection checked out of the pool.
+///
+/// Queries issued through the transaction run on that connection; queries
+/// issued through the [`ConnectionPool`] while a transaction is open run on
+/// *other* connections and do not see uncommitted changes. Dropping the
+/// transaction without calling [`commit`](Self::commit) rolls it back.
+pub struct Transaction {
+    inner: TransactionInner,
+    finished: bool,
+}
+
+enum TransactionInner {
+    #[cfg(feature = "sqlite")]
+    Sqlite(crate::sqlite::SqliteTransaction),
+    #[cfg(feature = "postgres-tokio")]
+    Postgres(crate::postgres::PgTransaction),
+    #[cfg(all(feature = "postgres", not(feature = "postgres-tokio")))]
+    PgQueue(crate::pool::RequestQueue),
+}
+
+impl Transaction {
+    /// Execute a raw SQL query on the transaction's connection.
+    pub async fn query(&self, query: &str) -> Result<QueryResult, Error> {
+        self.query_with_params(query, Vec::new()).await
+    }
+
+    /// Execute a parameterized statement on the transaction's connection.
+    pub async fn query_with_params(
+        &self,
+        query: &str,
+        params: Vec<Value>,
+    ) -> Result<QueryResult, Error> {
+        match &self.inner {
+            #[cfg(feature = "sqlite")]
+            TransactionInner::Sqlite(tx) => tx.query(Arc::from(query), params).await,
+            #[cfg(feature = "postgres-tokio")]
+            TransactionInner::Postgres(tx) => tx.query(Arc::from(query), params).await,
+            #[cfg(all(feature = "postgres", not(feature = "postgres-tokio")))]
+            TransactionInner::PgQueue(queue) => queue.query(Arc::from(query), params).await,
+        }
+    }
+
+    pub async fn commit(mut self) -> Result<(), Error> {
+        self.query("COMMIT;").await?;
+        self.finish();
+        Ok(())
+    }
+
+    pub async fn rollback(mut self) -> Result<(), Error> {
+        self.query("ROLLBACK;").await?;
+        self.finish();
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+        match &self.inner {
+            #[cfg(all(feature = "postgres", not(feature = "postgres-tokio")))]
+            TransactionInner::PgQueue(queue) => {
+                let _ = queue.sender().try_send(crate::pool::Request::Release);
+            }
+            // Slot-based transactions release their connection when the
+            // guard inside the inner handle drops.
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        match &self.inner {
+            #[cfg(feature = "sqlite")]
+            TransactionInner::Sqlite(tx) => tx.rollback_blocking(),
+            #[cfg(feature = "postgres-tokio")]
+            TransactionInner::Postgres(tx) => tx.rollback_spawn(),
+            #[cfg(all(feature = "postgres", not(feature = "postgres-tokio")))]
+            TransactionInner::PgQueue(queue) => {
+                let (response, _) = futures::channel::oneshot::channel();
+                let _ = queue.sender().try_send(crate::pool::Request::Query {
+                    sql: Arc::from("ROLLBACK;"),
+                    params: Vec::new(),
+                    response,
+                });
+                let _ = queue.sender().try_send(crate::pool::Request::Release);
+            }
+        }
     }
 }
 
@@ -448,7 +545,7 @@ impl Executor for Transaction {
 /// connection.
 #[derive(Clone)]
 pub struct PreparedQuery {
-    queue: RequestQueue,
+    backend: Arc<Backend>,
     sql: Arc<str>,
 }
 
@@ -459,7 +556,7 @@ impl PreparedQuery {
 
     /// Execute the statement and return its rows.
     pub async fn query(&self, params: Vec<Value>) -> Result<QueryResult, Error> {
-        self.queue.query(self.sql.clone(), params).await
+        self.backend.query(self.sql.clone(), params).await
     }
 
     /// Execute the statement and return the number of affected rows.
@@ -469,7 +566,7 @@ impl PreparedQuery {
 
     /// Execute the statement and stream its rows.
     pub async fn query_stream(&self, params: Vec<Value>) -> Result<RowStream, Error> {
-        self.queue.query_stream(self.sql.clone(), params).await
+        self.backend.query_stream(self.sql.clone(), params).await
     }
 }
 
@@ -532,12 +629,38 @@ impl Backend {
         }
     }
 
-    pub(crate) fn queue(&self) -> &RequestQueue {
+    pub(crate) async fn query(
+        &self,
+        sql: Arc<str>,
+        params: Vec<Value>,
+    ) -> Result<QueryResult, Error> {
         match self {
             #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
-            Backend::Postgres(postgres) => postgres.queue(),
+            Backend::Postgres(postgres) => postgres.query(sql, params).await,
             #[cfg(feature = "sqlite")]
-            Backend::Sqlite(sqlite) => sqlite.queue(),
+            Backend::Sqlite(sqlite) => sqlite.query(sql, params).await,
+        }
+    }
+
+    pub(crate) async fn prepare_only(&self, sql: Arc<str>) -> Result<(), Error> {
+        match self {
+            #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
+            Backend::Postgres(postgres) => postgres.prepare_only(sql).await,
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(sqlite) => sqlite.prepare_only(sql).await,
+        }
+    }
+
+    pub(crate) async fn query_stream(
+        &self,
+        sql: Arc<str>,
+        params: Vec<Value>,
+    ) -> Result<RowStream, Error> {
+        match self {
+            #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
+            Backend::Postgres(postgres) => postgres.query_stream(sql, params).await,
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(sqlite) => sqlite.query_stream(sql, params).await,
         }
     }
 }

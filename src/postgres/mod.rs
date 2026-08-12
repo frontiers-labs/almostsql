@@ -17,52 +17,24 @@ pub(crate) use postgres as driver;
 #[cfg(all(feature = "postgres", not(feature = "postgres-tokio")))]
 mod sync_worker;
 #[cfg(all(feature = "postgres", not(feature = "postgres-tokio")))]
-use sync_worker::spawn_worker;
+pub use sync_worker::PostgresBackend;
 
 #[cfg(feature = "postgres-tokio")]
-mod tokio_worker;
+mod tokio_client;
 #[cfg(feature = "postgres-tokio")]
-use tokio_worker::spawn_worker;
+pub use tokio_client::PostgresBackend;
+#[cfg(feature = "postgres-tokio")]
+pub(crate) use tokio_client::{PgRowStream, PgTransaction};
 
 use driver::types::{FromSql, IsNull, ToSql, Type, to_sql_checked};
 
 use crate::error::Error;
 use crate::migration::{AlterTable, Command, SqlType};
-use crate::pool::RequestQueue;
 use crate::query::{Columns, Row, Value};
-use crate::sql_builder::SQLBuilder;
 
-const POSTGRES_WORKERS: usize = 4;
-
-#[derive(Clone)]
-pub struct PostgresBackend {
-    queue: RequestQueue,
-}
+pub(crate) const POSTGRES_WORKERS: usize = 4;
 
 pub struct PostgresBuilder;
-
-impl PostgresBackend {
-    pub fn new(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let (queue, request_rx) = RequestQueue::new_shared();
-
-        // The first worker connects synchronously so a bad URL fails here
-        // rather than on the first query.
-        spawn_worker(url, request_rx.clone(), true)?;
-        for _ in 1..POSTGRES_WORKERS {
-            spawn_worker(url, request_rx.clone(), false)?;
-        }
-
-        Ok(Self { queue })
-    }
-
-    pub(crate) fn queue(&self) -> &RequestQueue {
-        &self.queue
-    }
-
-    pub fn builder(&self) -> SQLBuilder {
-        SQLBuilder::Postgres(PostgresBuilder {})
-    }
-}
 
 struct CachedStatement {
     statement: driver::Statement,
@@ -102,11 +74,11 @@ impl ToSql for PgNull {
     to_sql_checked!();
 }
 
-fn postgres_params(params: Vec<Value>) -> Vec<Box<dyn ToSql + Sync>> {
+fn postgres_params(params: Vec<Value>) -> Vec<Box<dyn ToSql + Sync + Send>> {
     params
         .into_iter()
         .map(|param| match param {
-            Value::Null => Box::new(PgNull) as Box<dyn ToSql + Sync>,
+            Value::Null => Box::new(PgNull) as Box<dyn ToSql + Sync + Send>,
             Value::Integer(i) => Box::new(i),
             Value::Real(r) => Box::new(r),
             Value::Text(s) => Box::new(s),
