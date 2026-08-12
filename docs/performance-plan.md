@@ -1,5 +1,14 @@
 # almostsql performance improvement plan
 
+> **Status: implemented.** All four phases landed (plus phase 0). Measured on
+> the shared micro-benchmark (in-memory SQLite, release build): 10k-row scans
+> ~1.75× faster, batched inserts ~21× faster per row than single-row inserts,
+> UPDATE/DELETE affected-row counts fixed, and `cargo bench` now tracks the
+> baselines. One deviation from the plan: the Postgres backend keeps the
+> synchronous `postgres` crate (now with per-connection statement caching and
+> four pooled connections) instead of migrating to `tokio-postgres`; the
+> migration remains a possible follow-up for pipelining.
+
 This document describes the current performance problems in almostsql and a
 phased plan to fix them. The headline gap — no way to precompile a query — is
 real, but it is a symptom of several deeper issues in the execution path. The

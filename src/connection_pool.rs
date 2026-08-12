@@ -1,3 +1,5 @@
+use crate::error::Error;
+use crate::pool::{RequestQueue, RowStream};
 #[cfg(feature = "postgres")]
 use crate::postgres::PostgresBackend;
 use crate::query::{QueryResult, Transaction, Value};
@@ -6,7 +8,22 @@ use crate::sql_builder::SQLBuilder;
 use crate::sqlite::SqliteBackend;
 use crate::{Migration, SchemaSet};
 use std::error::Error as StdError;
+use std::future::Future;
 use std::sync::Arc;
+
+/// Something queries can be executed on: a [`ConnectionPool`] (any pooled
+/// connection) or a [`Transaction`] (its checked-out connection).
+pub trait Executor {
+    fn query_with_params(
+        &self,
+        query: &str,
+        params: Vec<Value>,
+    ) -> impl Future<Output = Result<QueryResult, Error>> + Send;
+
+    fn query(&self, query: &str) -> impl Future<Output = Result<QueryResult, Error>> + Send {
+        self.query_with_params(query, Vec::new())
+    }
+}
 
 #[derive(Clone)]
 pub struct ConnectionPool {
@@ -57,6 +74,10 @@ impl ConnectionPool {
         })
     }
 
+    fn queue(&self) -> &RequestQueue {
+        self.backend.queue()
+    }
+
     /// Apply a single unnamed migration history. Equivalent to building a
     /// [`Migrator`] with one default-namespace [`SchemaSet`].
     pub async fn initialize_database(
@@ -80,7 +101,7 @@ impl ConnectionPool {
     /// Create the ledger if missing and upgrade legacy `(id, hash)` ledgers to
     /// the namespaced `(namespace, id, hash)` layout. Runs in autocommit so the
     /// column probe can fail harmlessly on Postgres.
-    pub async fn ensure_migrations_table(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    pub async fn ensure_migrations_table(&self) -> Result<(), Error> {
         self.query(
             "CREATE TABLE IF NOT EXISTS __migrations (namespace TEXT NOT NULL DEFAULT '', \
              id BIGINT NOT NULL, hash BIGINT NOT NULL, PRIMARY KEY (namespace, id));",
@@ -97,35 +118,39 @@ impl ConnectionPool {
             // primary key is in place; otherwise a second namespace's id=0 would
             // collide with the default namespace's id=0.
             let transaction = self.transaction().await?;
-            self.query("ALTER TABLE __migrations RENAME TO __migrations_legacy;")
+            transaction
+                .query("ALTER TABLE __migrations RENAME TO __migrations_legacy;")
                 .await?;
-            self.query(
-                "CREATE TABLE __migrations (namespace TEXT NOT NULL DEFAULT '', \
-                 id BIGINT NOT NULL, hash BIGINT NOT NULL, PRIMARY KEY (namespace, id));",
-            )
-            .await?;
-            self.query(
-                "INSERT INTO __migrations (namespace, id, hash) \
-                 SELECT '', id, hash FROM __migrations_legacy;",
-            )
-            .await?;
-            self.query("DROP TABLE __migrations_legacy;").await?;
+            transaction
+                .query(
+                    "CREATE TABLE __migrations (namespace TEXT NOT NULL DEFAULT '', \
+                     id BIGINT NOT NULL, hash BIGINT NOT NULL, PRIMARY KEY (namespace, id));",
+                )
+                .await?;
+            transaction
+                .query(
+                    "INSERT INTO __migrations (namespace, id, hash) \
+                     SELECT '', id, hash FROM __migrations_legacy;",
+                )
+                .await?;
+            transaction.query("DROP TABLE __migrations_legacy;").await?;
             transaction.commit().await?;
         }
 
         Ok(())
     }
 
-    /// Apply the pending migrations of one namespace. Assumes a transaction is
-    /// already active and that the ledger table exists.
+    /// Apply the pending migrations of one namespace on the transaction's
+    /// connection. Assumes the ledger table exists.
     async fn apply_pending(
         &self,
+        transaction: &Transaction,
         namespace: &str,
         migrations: &[Migration],
     ) -> Result<(), Box<dyn StdError + Send + Sync>> {
         let hashes = migrations.iter().map(migration_hash).collect::<Vec<_>>();
 
-        let existing = self
+        let existing = transaction
             .query_with_params(
                 "SELECT hash FROM __migrations WHERE namespace = ? ORDER BY id;",
                 vec![Value::Text(namespace.to_string())],
@@ -159,66 +184,79 @@ impl ConnectionPool {
         {
             for t in m.get_tables() {
                 for sql in self.backend.builder().build_table_setup(t).unwrap() {
-                    self.query(&sql).await?;
+                    transaction.query(&sql).await?;
                 }
                 // FIXME correctly handle error
                 let sql = t.to_sql(&self.backend).unwrap();
-                self.query(&sql).await?;
+                transaction.query(&sql).await?;
             }
 
             for a in m.get_alters() {
                 // FIXME correctly handle error
                 for sql in a.to_sql(&self.backend).unwrap() {
-                    self.query(&sql).await?;
+                    transaction.query(&sql).await?;
                 }
             }
 
             for r in m.get_raw_queries() {
-                self.query(r).await?;
+                transaction.query(r).await?;
             }
 
-            self.query_with_params(
-                "INSERT INTO __migrations (namespace, id, hash) VALUES(?, ?, ?)",
-                vec![
-                    Value::Text(namespace.to_string()),
-                    Value::Integer(idx as i64),
-                    Value::Integer(*hash as i64),
-                ],
-            )
-            .await?;
+            transaction
+                .query_with_params(
+                    "INSERT INTO __migrations (namespace, id, hash) VALUES(?, ?, ?)",
+                    vec![
+                        Value::Text(namespace.to_string()),
+                        Value::Integer(idx as i64),
+                        Value::Integer(*hash as i64),
+                    ],
+                )
+                .await?;
         }
 
         Ok(())
     }
 
     /// Execute a raw SQL query asynchronously
-    pub async fn query(&self, query: &str) -> Result<QueryResult, Box<dyn StdError + Send + Sync>> {
-        match &*self.backend {
-            #[cfg(feature = "postgres")]
-            Backend::Postgres(postgres) => postgres.query(query).await,
-            #[cfg(feature = "sqlite")]
-            Backend::Sqlite(sqlite) => sqlite.query(query).await,
-        }
+    pub async fn query(&self, query: &str) -> Result<QueryResult, Error> {
+        self.queue().query(Arc::from(query), Vec::new()).await
     }
 
-    /// Execute a prepared statement with parameters asynchronously
+    /// Execute a parameterized statement asynchronously. Statements are
+    /// prepared once per pooled connection and cached, so repeated calls with
+    /// the same SQL text skip re-compilation.
     pub async fn query_with_params(
         &self,
         query: &str,
         params: Vec<Value>,
-    ) -> Result<QueryResult, Box<dyn StdError + Send + Sync>> {
-        match &*self.backend {
-            #[cfg(feature = "postgres")]
-            Backend::Postgres(postgres) => postgres.query_with_params(query, params).await,
-            #[cfg(feature = "sqlite")]
-            Backend::Sqlite(sqlite) => sqlite.query_with_params(query, params).await,
-        }
+    ) -> Result<QueryResult, Error> {
+        self.queue().query(Arc::from(query), params).await
+    }
+
+    /// Precompile a statement and return a reusable handle. The statement is
+    /// prepared eagerly (so syntax errors surface here) and cached on each
+    /// pooled connection it runs on; executing the handle skips SQL
+    /// generation and re-preparation entirely.
+    pub async fn prepare(&self, query: &str) -> Result<PreparedQuery, Error> {
+        let sql: Arc<str> = Arc::from(query);
+        self.queue().prepare(sql.clone()).await?;
+        Ok(PreparedQuery {
+            queue: self.queue().clone(),
+            sql,
+        })
+    }
+
+    /// Execute a query and stream its rows without materializing the whole
+    /// result set. Rows arrive in bounded chunks from the connection worker;
+    /// dropping the stream cancels the remaining work.
+    pub async fn query_stream(&self, query: &str, params: Vec<Value>) -> Result<RowStream, Error> {
+        self.queue().query_stream(Arc::from(query), params).await
     }
 
     pub async fn vector_search<Tab>(
         &self,
         search: crate::VectorSearch<Tab>,
-    ) -> Result<QueryResult, Box<dyn StdError + Send + Sync>> {
+    ) -> Result<QueryResult, Error> {
         let (query, params) = self.backend.builder().build_vector_search(&search).unwrap();
         self.query_with_params(&query, params).await
     }
@@ -316,12 +354,14 @@ impl ConnectionPool {
         }
 
         let transaction = self.transaction().await?;
-        self.query(&format!("ALTER TABLE {table} DROP COLUMN {vector_column};"))
+        transaction
+            .query(&format!("ALTER TABLE {table} DROP COLUMN {vector_column};"))
             .await?;
-        self.query(&format!(
-            "ALTER TABLE {table} RENAME COLUMN {repair_column} TO {vector_column};"
-        ))
-        .await?;
+        transaction
+            .query(&format!(
+                "ALTER TABLE {table} RENAME COLUMN {repair_column} TO {vector_column};"
+            ))
+            .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -368,19 +408,68 @@ impl ConnectionPool {
         Ok(())
     }
 
-    pub async fn transaction(&self) -> Result<Transaction, Box<dyn StdError + Send + Sync>> {
-        match &*self.backend {
-            #[cfg(feature = "postgres")]
-            Backend::Postgres(postgres) => postgres
-                .begin_transaction()
-                .await
-                .map(|_| Transaction::new(self.backend.clone())),
-            #[cfg(feature = "sqlite")]
-            Backend::Sqlite(sqlite) => sqlite
-                .begin_transaction()
-                .await
-                .map(|_| Transaction::new(self.backend.clone())),
-        }
+    /// Begin a transaction on a dedicated connection checked out from the
+    /// pool. Issue the transaction's statements through the returned
+    /// [`Transaction`]; queries made on the pool meanwhile run on other
+    /// connections and do not join the transaction.
+    pub async fn transaction(&self) -> Result<Transaction, Error> {
+        let queue = self.queue().checkout().await?;
+        let transaction = Transaction::new(queue);
+        transaction.query("BEGIN;").await?;
+        Ok(transaction)
+    }
+}
+
+impl Executor for ConnectionPool {
+    fn query_with_params(
+        &self,
+        query: &str,
+        params: Vec<Value>,
+    ) -> impl Future<Output = Result<QueryResult, Error>> + Send {
+        ConnectionPool::query_with_params(self, query, params)
+    }
+}
+
+impl Executor for Transaction {
+    fn query_with_params(
+        &self,
+        query: &str,
+        params: Vec<Value>,
+    ) -> impl Future<Output = Result<QueryResult, Error>> + Send {
+        Transaction::query_with_params(self, query, params)
+    }
+}
+
+/// A precompiled statement bound to a connection pool.
+///
+/// Created with [`ConnectionPool::prepare`]. Executing it ships only the
+/// parameter values to a connection worker; the SQL text travels as a shared
+/// reference and the statement itself is prepared at most once per pooled
+/// connection.
+#[derive(Clone)]
+pub struct PreparedQuery {
+    queue: RequestQueue,
+    sql: Arc<str>,
+}
+
+impl PreparedQuery {
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// Execute the statement and return its rows.
+    pub async fn query(&self, params: Vec<Value>) -> Result<QueryResult, Error> {
+        self.queue.query(self.sql.clone(), params).await
+    }
+
+    /// Execute the statement and return the number of affected rows.
+    pub async fn execute(&self, params: Vec<Value>) -> Result<usize, Error> {
+        Ok(self.query(params).await?.affected_rows())
+    }
+
+    /// Execute the statement and stream its rows.
+    pub async fn query_stream(&self, params: Vec<Value>) -> Result<RowStream, Error> {
+        self.queue.query_stream(self.sql.clone(), params).await
     }
 }
 
@@ -391,6 +480,15 @@ impl Backend {
             Backend::Postgres(postgres) => postgres.builder(),
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(sqlite) => sqlite.builder(),
+        }
+    }
+
+    pub(crate) fn queue(&self) -> &RequestQueue {
+        match self {
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(postgres) => postgres.queue(),
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(sqlite) => sqlite.queue(),
         }
     }
 }
@@ -448,9 +546,10 @@ impl<'a> Migrator<'a> {
         let transaction = self.pool.transaction().await?;
         for set in &self.sets {
             self.pool
-                .apply_pending(set.name(), set.migrations())
+                .apply_pending(&transaction, set.name(), set.migrations())
                 .await?;
         }
-        transaction.commit().await
+        transaction.commit().await?;
+        Ok(())
     }
 }

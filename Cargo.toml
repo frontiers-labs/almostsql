@@ -23,14 +23,19 @@ postgres = ["dep:postgres"]
 
 [dependencies]
 almostsql-macros = { version = "0.1.0", path = "almostsql-macros" }
+async-channel = "2.5.0"
 bytes = "1"
 futures = "0.3.32"
 postgres = { version = "0.19.12", features = ["with-uuid-1"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 sqlite = { version = "0.37.0", features = ["bundled"], optional = true }
 sqlite-vec = { version = "0.1.9", optional = true }
-sqlparser = "0.61.0"
 uuid = { version = "1.23.1", features = ["v4", "v7"] }
 
 [dev-dependencies]
+criterion = "0.8.2"
 tokio = { version = "1.52.1", features = ["macros", "rt"] }
+
+[[bench]]
+name = "queries"
+harness = false

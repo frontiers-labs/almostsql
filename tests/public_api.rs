@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use almostsql::{
     BitVec, Column, ConnectionPool, Delete, FloatVec, FromValue, Int8Vec, QueryResult, Row, Select,
     Update, Value,
@@ -19,10 +17,10 @@ fn connection_pool_rejects_unsupported_urls() {
 
 #[test]
 fn query_result_reports_rows_and_affected_count() {
-    let row = Row::new(HashMap::from([
+    let row = Row::from_pairs(vec![
         ("id".to_string(), Value::Integer(7)),
         ("name".to_string(), Value::Text("Ada".to_string())),
-    ]));
+    ]);
     let result = QueryResult::new(vec![row], 3);
 
     assert_eq!(result.row_count(), 1);

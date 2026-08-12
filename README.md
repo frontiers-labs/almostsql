@@ -13,6 +13,8 @@ The API is pre-1.0 and may change between minor releases.
 - Typed schema, insert, select, update, and delete builders
 - Named migration sets that let independent crates share one database
 - Explicit safeguards against accidental unfiltered updates and deletes
+- Connection pooling with per-connection prepared-statement caching
+- Precompiled queries, batched inserts, and streaming result sets
 
 ## Installation
 
@@ -73,6 +75,62 @@ assert_eq!(user.name, "Ada");
 The `migrations!` macro supports tables, primary and unique keys, foreign keys,
 raw SQL, table alterations, custom column names, nullable fields, and vector
 columns. See the integration tests for complete examples.
+
+## Performance
+
+Statements are prepared once per pooled connection and cached, so repeated
+queries with the same SQL text — including everything the typed builders
+generate — skip re-compilation automatically. On top of that:
+
+**Precompiled queries.** `prepare` validates a statement eagerly and returns a
+reusable handle; executing it ships only the parameter values:
+
+```rust,ignore
+let by_id = db.prepare("SELECT name FROM users WHERE id = ?").await?;
+let user = by_id.query(vec![Value::Uuid(id)]).await?;
+```
+
+**Batched inserts.** `insert_batch` writes many rows per statement (chunked to
+respect bind-parameter limits, atomic across chunks):
+
+```rust,ignore
+let mut batch = users::insert_batch();
+for user in new_users {
+    batch = batch.add(users::insert().id(user.id).name(user.name).age(user.age));
+}
+batch.execute(&db).await?;
+```
+
+**Streaming results.** `query_stream` yields rows in bounded chunks instead of
+materializing the whole result set:
+
+```rust,ignore
+use futures::TryStreamExt;
+let mut rows = db.query_stream("SELECT * FROM users;", Vec::new()).await?;
+while let Some(row) = rows.try_next().await? {
+    /* ... */
+}
+```
+
+**Connection pooling.** File-backed SQLite (in WAL mode) and Postgres pools
+hold several connections, so independent queries run concurrently. In-memory
+SQLite keeps a single connection, since each `:memory:` connection would be a
+separate database.
+
+## Transactions
+
+A transaction checks a dedicated connection out of the pool. Issue its
+statements through the `Transaction` handle — the typed builders accept either
+a pool or a transaction:
+
+```rust,ignore
+let tx = db.transaction().await?;
+users::insert().id(id).name("Ada").age(36_i64).execute(&tx).await?;
+tx.commit().await?; // dropping the handle without commit rolls back
+```
+
+Queries made on the pool while a transaction is open run on other connections
+and do not join it.
 
 ## Database URLs
 

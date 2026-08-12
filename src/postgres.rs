@@ -1,128 +1,45 @@
-use std::collections::HashMap;
-use std::error::Error as StdError;
 use std::sync::Arc;
 use std::thread;
 
+use async_channel::Receiver;
 use bytes::BytesMut;
-use futures::StreamExt;
-use futures::channel::{mpsc, oneshot};
+use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::{FromSql, IsNull, ToSql, Type, to_sql_checked};
 use postgres::{Client, NoTls};
 
+use crate::error::Error;
 use crate::migration::{AlterTable, Command, SqlType};
-use crate::query::{QueryResult, Row, Value};
+use crate::pool::{
+    CacheSlots, Request, RequestQueue, STATEMENT_CACHE_CAPACITY, STREAM_CHUNK_ROWS, is_ddl,
+};
+use crate::query::{Columns, QueryResult, Row, Value};
 use crate::sql_builder::SQLBuilder;
+
+const POSTGRES_WORKERS: usize = 4;
 
 #[derive(Clone)]
 pub struct PostgresBackend {
-    request_tx: Arc<mpsc::UnboundedSender<WorkerRequest>>,
-}
-
-enum WorkerRequest {
-    Query {
-        query: String,
-        params: Vec<Value>,
-        response: oneshot::Sender<Result<QueryResult, String>>,
-    },
-    Rollback,
+    queue: RequestQueue,
 }
 
 pub struct PostgresBuilder;
 
 impl PostgresBackend {
-    pub fn new(url: &str) -> Result<Self, Box<dyn StdError + Send + Sync>> {
-        let url = url.to_string();
-        let (request_tx, mut request_rx) = mpsc::unbounded::<WorkerRequest>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    pub fn new(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (queue, request_rx) = RequestQueue::new_shared();
 
-        // The synchronous `postgres` client drives its own Tokio runtime via
-        // `block_on`, which panics when invoked from a thread already inside the
-        // server's async runtime. Pin the client to a dedicated OS thread so its
-        // internal runtime is the only one on that thread.
-        thread::Builder::new()
-            .name("almostsql-postgres-worker".to_string())
-            .spawn(move || {
-                let mut client = match Client::connect(&url, NoTls) {
-                    Ok(client) => {
-                        let _ = ready_tx.send(Ok(()));
-                        client
-                    }
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error.to_string()));
-                        return;
-                    }
-                };
+        // The first worker connects synchronously so a bad URL fails here
+        // rather than on the first query.
+        spawn_worker(url, request_rx.clone(), true)?;
+        for _ in 1..POSTGRES_WORKERS {
+            spawn_worker(url, request_rx.clone(), false)?;
+        }
 
-                futures::executor::block_on(async move {
-                    while let Some(request) = request_rx.next().await {
-                        match request {
-                            WorkerRequest::Query {
-                                query,
-                                params,
-                                response,
-                            } => {
-                                let result = run_query(&mut client, &query, params);
-                                let _ = response.send(result);
-                            }
-                            WorkerRequest::Rollback => {
-                                let _ = client.simple_query("ROLLBACK;");
-                            }
-                        }
-                    }
-                });
-            })?;
-
-        ready_rx
-            .recv()
-            .map_err(|_| "postgres worker stopped before connecting".to_string())??;
-
-        Ok(Self {
-            request_tx: Arc::new(request_tx),
-        })
+        Ok(Self { queue })
     }
 
-    pub async fn query(&self, query: &str) -> Result<QueryResult, Box<dyn StdError + Send + Sync>> {
-        self.send_query(query, Vec::new()).await
-    }
-
-    pub async fn query_with_params(
-        &self,
-        query: &str,
-        params: Vec<Value>,
-    ) -> Result<QueryResult, Box<dyn StdError + Send + Sync>> {
-        self.send_query(query, params).await
-    }
-
-    async fn send_query(
-        &self,
-        query: &str,
-        params: Vec<Value>,
-    ) -> Result<QueryResult, Box<dyn StdError + Send + Sync>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.request_tx
-            .unbounded_send(WorkerRequest::Query {
-                query: query.to_string(),
-                params,
-                response: response_tx,
-            })
-            .map_err(|_| "postgres worker is unavailable".to_string())?;
-
-        response_rx
-            .await
-            .map_err(|_| "postgres worker stopped before responding".to_string())?
-            .map_err(Into::into)
-    }
-
-    pub async fn begin_transaction(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
-        self.query("BEGIN;").await.map(|_| ())
-    }
-
-    pub async fn commit_transaction(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
-        self.query("COMMIT;").await.map(|_| ())
-    }
-
-    pub(crate) fn rollback_transaction_fire_and_forget(&self) {
-        let _ = self.request_tx.unbounded_send(WorkerRequest::Rollback);
+    pub(crate) fn queue(&self) -> &RequestQueue {
+        &self.queue
     }
 
     pub fn builder(&self) -> SQLBuilder {
@@ -130,30 +47,217 @@ impl PostgresBackend {
     }
 }
 
-fn run_query(client: &mut Client, query: &str, params: Vec<Value>) -> Result<QueryResult, String> {
-    let query = postgres_placeholders(query);
+fn spawn_worker(
+    url: &str,
+    request_rx: Receiver<Request>,
+    fail_fast: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = url.to_string();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    // The synchronous `postgres` client drives its own Tokio runtime via
+    // `block_on`, which panics when invoked from a thread already inside the
+    // server's async runtime. Pin each client to a dedicated OS thread so its
+    // internal runtime is the only one on that thread.
+    thread::Builder::new()
+        .name("almostsql-postgres-worker".to_string())
+        .spawn(move || {
+            let mut client = match Client::connect(&url, NoTls) {
+                Ok(client) => {
+                    let _ = ready_tx.send(Ok(()));
+                    client
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            worker_loop(&mut client, request_rx);
+        })?;
+
+    if fail_fast {
+        ready_rx
+            .recv()
+            .map_err(|_| "postgres worker stopped before connecting".to_string())??;
+    }
+    Ok(())
+}
+
+struct CachedStatement {
+    statement: postgres::Statement,
+}
+
+fn worker_loop(client: &mut Client, request_rx: Receiver<Request>) {
+    let mut cache: CacheSlots<CachedStatement> = CacheSlots::new(STATEMENT_CACHE_CAPACITY);
+
+    while let Ok(request) = request_rx.recv_blocking() {
+        match request {
+            Request::Checkout { response } => {
+                let (private_tx, private_rx) = async_channel::unbounded();
+                if response.send(private_tx).is_err() {
+                    continue;
+                }
+                while let Ok(request) = private_rx.recv_blocking() {
+                    match request {
+                        Request::Release => break,
+                        Request::Checkout { .. } => {}
+                        other => dispatch(client, &mut cache, other),
+                    }
+                }
+            }
+            Request::Release => {}
+            other => dispatch(client, &mut cache, other),
+        }
+    }
+}
+
+fn dispatch(client: &mut Client, cache: &mut CacheSlots<CachedStatement>, request: Request) {
+    match request {
+        Request::Query {
+            sql,
+            params,
+            response,
+        } => {
+            let result = execute(client, cache, &sql, params);
+            let _ = response.send(result);
+        }
+        Request::Prepare { sql, response } => {
+            let result = ensure_cached(client, cache, &sql).map(|_| ());
+            let _ = response.send(result);
+        }
+        Request::QueryStream {
+            sql,
+            params,
+            chunks,
+        } => {
+            execute_stream(client, cache, &sql, params, &chunks);
+        }
+        Request::Checkout { .. } | Request::Release => {}
+    }
+}
+
+fn ensure_cached<'c>(
+    client: &mut Client,
+    cache: &'c mut CacheSlots<CachedStatement>,
+    sql: &Arc<str>,
+) -> Result<&'c mut CachedStatement, Error> {
+    if cache.get_mut(sql).is_none() {
+        // The `?` → `$n` rewrite happens once here, at prepare time.
+        let rewritten = postgres_placeholders(sql);
+        let statement = client
+            .prepare(&rewritten)
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        cache.insert(sql.clone(), CachedStatement { statement });
+    }
+    Ok(cache.get_mut(sql).expect("statement was just cached"))
+}
+
+fn execute(
+    client: &mut Client,
+    cache: &mut CacheSlots<CachedStatement>,
+    sql: &Arc<str>,
+    params: Vec<Value>,
+) -> Result<QueryResult, Error> {
+    if is_ddl(sql) {
+        // Run DDL outside the cache (it may contain several statements) and
+        // drop cached statements that may reference the old schema.
+        let result = client
+            .batch_execute(sql)
+            .map(|_| QueryResult::new(Vec::new(), 0))
+            .map_err(|e| Error::Backend(e.to_string()));
+        cache.clear();
+        return result;
+    }
+
+    let statement = ensure_cached(client, cache, sql)?.statement.clone();
     let params = postgres_params(params);
     let param_refs = params
         .iter()
         .map(|p| &**p as &(dyn ToSql + Sync))
         .collect::<Vec<_>>();
 
-    if returns_rows(&query) {
+    // The prepared statement knows whether it returns rows — no query-text
+    // sniffing needed.
+    if statement.columns().is_empty() {
+        let affected_rows = client
+            .execute(&statement, &param_refs)
+            .map_err(|e| Error::Backend(e.to_string()))? as usize;
+        Ok(QueryResult::new(Vec::new(), affected_rows))
+    } else {
+        let columns = Arc::new(Columns::new(
+            statement
+                .columns()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect(),
+        ));
         let rows = client
-            .query(&query, &param_refs)
-            .map_err(|e| e.to_string())?;
+            .query(&statement, &param_refs)
+            .map_err(|e| Error::Backend(e.to_string()))?;
         let rows = rows
             .into_iter()
-            .map(postgres_row)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+            .map(|row| postgres_row(&row, &columns))
+            .collect::<Result<Vec<_>, _>>()?;
         let affected_rows = rows.len();
         Ok(QueryResult::new(rows, affected_rows))
-    } else {
-        let affected_rows = client
-            .execute(&query, &param_refs)
-            .map_err(|e| e.to_string())? as usize;
-        Ok(QueryResult::new(Vec::new(), affected_rows))
+    }
+}
+
+fn execute_stream(
+    client: &mut Client,
+    cache: &mut CacheSlots<CachedStatement>,
+    sql: &Arc<str>,
+    params: Vec<Value>,
+    chunks: &async_channel::Sender<Result<Vec<Row>, Error>>,
+) {
+    if is_ddl(sql) {
+        let _ = chunks.send_blocking(Err(Error::InvalidQuery(
+            "cannot stream a schema-changing statement".into(),
+        )));
+        return;
+    }
+
+    let statement = match ensure_cached(client, cache, sql) {
+        Ok(cached) => cached.statement.clone(),
+        Err(error) => {
+            let _ = chunks.send_blocking(Err(error));
+            return;
+        }
+    };
+    let columns = Arc::new(Columns::new(
+        statement
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect(),
+    ));
+    let params = postgres_params(params);
+
+    let result = (|| -> Result<(), Error> {
+        let mut row_iter = client
+            .query_raw(
+                &statement,
+                params.iter().map(|p| &**p as &(dyn ToSql + Sync)),
+            )
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let mut chunk = Vec::with_capacity(STREAM_CHUNK_ROWS);
+        while let Some(row) = row_iter.next().map_err(|e| Error::Backend(e.to_string()))? {
+            chunk.push(postgres_row(&row, &columns)?);
+            if chunk.len() >= STREAM_CHUNK_ROWS {
+                let full = std::mem::replace(&mut chunk, Vec::with_capacity(STREAM_CHUNK_ROWS));
+                if chunks.send_blocking(Ok(full)).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let _ = chunks.send_blocking(Ok(chunk));
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = chunks.send_blocking(Err(error));
     }
 }
 
@@ -168,7 +272,7 @@ impl ToSql for PgNull {
         &self,
         _ty: &Type,
         _out: &mut BytesMut,
-    ) -> Result<IsNull, Box<dyn StdError + Sync + Send>> {
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
         Ok(IsNull::Yes)
     }
 
@@ -211,68 +315,63 @@ fn postgres_placeholders(query: &str) -> String {
     out
 }
 
-fn returns_rows(query: &str) -> bool {
-    let query = query.trim_start().to_ascii_uppercase();
-    query.starts_with("SELECT") || query.starts_with("WITH") || query.contains(" RETURNING ")
-}
-
-fn postgres_row(row: postgres::Row) -> Result<Row, Box<dyn StdError + Send + Sync>> {
-    let mut values = HashMap::new();
+fn postgres_row(row: &postgres::Row, columns: &Arc<Columns>) -> Result<Row, Error> {
+    let mut values = Vec::with_capacity(row.columns().len());
 
     for (idx, column) in row.columns().iter().enumerate() {
         let ty = column.type_();
         let value = if *ty == Type::INT2 {
-            row.try_get::<_, Option<i16>>(idx)?
-                .map(|v| Value::Integer(v as i64))
+            try_get(row, idx)?
+                .map(|v: i16| Value::Integer(v as i64))
                 .unwrap_or(Value::Null)
         } else if *ty == Type::INT4 {
-            row.try_get::<_, Option<i32>>(idx)?
-                .map(|v| Value::Integer(v as i64))
+            try_get(row, idx)?
+                .map(|v: i32| Value::Integer(v as i64))
                 .unwrap_or(Value::Null)
         } else if *ty == Type::INT8 {
-            row.try_get::<_, Option<i64>>(idx)?
+            try_get(row, idx)?
                 .map(Value::Integer)
                 .unwrap_or(Value::Null)
         } else if *ty == Type::FLOAT4 {
-            row.try_get::<_, Option<f32>>(idx)?
-                .map(|v| Value::Real(v as f64))
+            try_get(row, idx)?
+                .map(|v: f32| Value::Real(v as f64))
                 .unwrap_or(Value::Null)
         } else if *ty == Type::FLOAT8 {
-            row.try_get::<_, Option<f64>>(idx)?
-                .map(Value::Real)
-                .unwrap_or(Value::Null)
+            try_get(row, idx)?.map(Value::Real).unwrap_or(Value::Null)
         } else if *ty == Type::BOOL {
-            row.try_get::<_, Option<bool>>(idx)?
-                .map(|v| Value::Integer(if v { 1 } else { 0 }))
+            try_get(row, idx)?
+                .map(|v: bool| Value::Integer(if v { 1 } else { 0 }))
                 .unwrap_or(Value::Null)
         } else if *ty == Type::BYTEA {
-            row.try_get::<_, Option<Vec<u8>>>(idx)?
-                .map(Value::Blob)
-                .unwrap_or(Value::Null)
+            try_get(row, idx)?.map(Value::Blob).unwrap_or(Value::Null)
         } else if ty.name() == "vector" {
-            row.try_get::<_, Option<PgVector>>(idx)?
-                .map(|v| Value::FloatVector(v.0))
+            try_get(row, idx)?
+                .map(|v: PgVector| Value::FloatVector(v.0))
                 .unwrap_or(Value::Null)
         } else if *ty == Type::UUID {
-            row.try_get::<_, Option<uuid::Uuid>>(idx)?
-                .map(Value::Uuid)
-                .unwrap_or(Value::Null)
+            try_get(row, idx)?.map(Value::Uuid).unwrap_or(Value::Null)
         } else if *ty == Type::TEXT
             || *ty == Type::VARCHAR
             || *ty == Type::BPCHAR
             || *ty == Type::NAME
         {
-            row.try_get::<_, Option<String>>(idx)?
-                .map(Value::Text)
-                .unwrap_or(Value::Null)
+            try_get(row, idx)?.map(Value::Text).unwrap_or(Value::Null)
         } else {
-            return Err(format!("unsupported postgres column type: {}", ty.name()).into());
+            return Err(Error::Backend(format!(
+                "unsupported postgres column type: {}",
+                ty.name()
+            )));
         };
 
-        values.insert(column.name().to_string(), value);
+        values.push(value);
     }
 
-    Ok(Row::new(values))
+    Ok(Row::new(columns.clone(), values))
+}
+
+fn try_get<'a, T: FromSql<'a>>(row: &'a postgres::Row, idx: usize) -> Result<Option<T>, Error> {
+    row.try_get::<_, Option<T>>(idx)
+        .map_err(|e| Error::Backend(e.to_string()))
 }
 
 impl PostgresBuilder {
@@ -376,7 +475,7 @@ impl ToSql for PgVector {
         &self,
         ty: &Type,
         out: &mut BytesMut,
-    ) -> Result<IsNull, Box<dyn StdError + Sync + Send>> {
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
         if !<Self as ToSql>::accepts(ty) {
             return Err(format!("expected pgvector type, got {}", ty.name()).into());
         }
@@ -397,7 +496,10 @@ impl ToSql for PgVector {
 }
 
 impl<'a> FromSql<'a> for PgVector {
-    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn StdError + Sync + Send>> {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         if !<Self as FromSql>::accepts(ty) {
             return Err(format!("expected pgvector type, got {}", ty.name()).into());
         }

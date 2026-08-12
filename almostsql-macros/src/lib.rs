@@ -548,7 +548,7 @@ impl Table {
                 let name_ident = &c.name;
                 let ty = &c.ty;
                 let db_name = c.column_name.clone().unwrap_or_else(|| c.name.to_string());
-                quote! { #name_ident: r.decode::<#ty>(#db_name)? }
+                quote! { #name_ident: r.take_decode::<#ty>(#db_name)? }
             })
             .collect();
 
@@ -634,11 +634,11 @@ impl Table {
                     }
 
                     /// Fetch all rows for this select
-                    pub async fn all(self, db: &::almostsql::ConnectionPool) -> Result<Vec<Row>, Box<dyn std::error::Error + Send + Sync>> {
+                    pub async fn all(self, db: &impl ::almostsql::Executor) -> Result<Vec<Row>, Box<dyn std::error::Error + Send + Sync>> {
                         let (sql, params) = self.0.to_sql();
                         let res = db.query_with_params(&sql, params).await?;
-                        let mut out = Vec::with_capacity(res.rows().len());
-                        for r in res.rows() {
+                        let mut out = Vec::with_capacity(res.row_count());
+                        for mut r in res.into_rows() {
                             let row = Row { #( #row_inits, )* };
                             out.push(row);
                         }
@@ -646,7 +646,7 @@ impl Table {
                     }
 
                     /// Fetch exactly one row or return an error
-                    pub async fn one(self, db: &::almostsql::ConnectionPool) -> Result<Row, Box<dyn std::error::Error + Send + Sync>> {
+                    pub async fn one(self, db: &impl ::almostsql::Executor) -> Result<Row, Box<dyn std::error::Error + Send + Sync>> {
                         let mut rows = self.limit(1).all(db).await?;
                         rows.pop().ok_or_else(|| "query returned 0 rows".into())
                     }
@@ -677,19 +677,19 @@ impl Table {
                         SelectColsQuery(self.0.order_by(column, false))
                     }
 
-                    pub async fn all(self, db: &::almostsql::ConnectionPool) -> Result<Vec<<C as ::almostsql::SelectList<Table>>::Out>, Box<dyn std::error::Error + Send + Sync>> {
+                    pub async fn all(self, db: &impl ::almostsql::Executor) -> Result<Vec<<C as ::almostsql::SelectList<Table>>::Out>, Box<dyn std::error::Error + Send + Sync>> {
                         let (sql, params) = self.0.to_sql();
                         let res = db.query_with_params(&sql, params).await?;
-                        let mut out = Vec::with_capacity(res.rows().len());
+                        let mut out = Vec::with_capacity(res.row_count());
                         let colnames = self.0.names_slice().to_vec();
-                        for r in res.rows() {
-                            let row = <C as ::almostsql::SelectList<Table>>::decode_row(r, &colnames)?;
+                        for mut r in res.into_rows() {
+                            let row = <C as ::almostsql::SelectList<Table>>::decode_row(&mut r, &colnames)?;
                             out.push(row);
                         }
                         Ok(out)
                     }
 
-                    pub async fn one(self, db: &::almostsql::ConnectionPool) -> Result<<C as ::almostsql::SelectList<Table>>::Out, Box<dyn std::error::Error + Send + Sync>> {
+                    pub async fn one(self, db: &impl ::almostsql::Executor) -> Result<<C as ::almostsql::SelectList<Table>>::Out, Box<dyn std::error::Error + Send + Sync>> {
                         let mut rows = self.limit(1).all(db).await?;
                         rows.pop().ok_or_else(|| "query returned 0 rows".into())
                     }
@@ -709,7 +709,7 @@ impl Table {
                 impl InsertBuilder {
                     #(#insert_setters)*
 
-                    pub async fn execute(self, db: &::almostsql::ConnectionPool) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+                    pub async fn execute(self, db: &impl ::almostsql::Executor) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
                         if self.cols.is_empty() {
                             return Ok(0);
                         }
@@ -725,6 +725,42 @@ impl Table {
                         );
                         let res = db.query_with_params(&sql, self.params).await?;
                         Ok(res.affected_rows())
+                    }
+                }
+
+                /// Typed multi-row INSERT for this table. Rows are written in
+                /// chunked `VALUES` statements; multi-chunk batches run in one
+                /// transaction.
+                pub struct BatchInsertBuilder(pub(crate) ::almostsql::BatchInsert);
+
+                /// Start a batched INSERT for this table.
+                pub fn insert_batch() -> BatchInsertBuilder {
+                    BatchInsertBuilder(::almostsql::BatchInsert::new(TABLE_NAME))
+                }
+
+                impl BatchInsertBuilder {
+                    /// Add one row built with [`insert()`]. All rows must set
+                    /// the same columns; a mismatch errors at execute time.
+                    pub fn add(mut self, row: InsertBuilder) -> Self {
+                        self.0.push(&row.cols, row.params);
+                        self
+                    }
+
+                    pub fn len(&self) -> usize {
+                        self.0.len()
+                    }
+
+                    pub fn is_empty(&self) -> bool {
+                        self.0.is_empty()
+                    }
+
+                    pub async fn execute(self, db: &::almostsql::ConnectionPool) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+                        Ok(self.0.execute(db).await?)
+                    }
+
+                    /// Execute on an existing transaction's connection.
+                    pub async fn execute_in(self, transaction: &::almostsql::Transaction) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+                        Ok(self.0.execute_in(transaction).await?)
                     }
                 }
 
@@ -751,7 +787,7 @@ impl Table {
                         self
                     }
 
-                    pub async fn execute(self, db: &::almostsql::ConnectionPool) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+                    pub async fn execute(self, db: &impl ::almostsql::Executor) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
                         if self.0.is_empty() {
                             return Ok(0);
                         }
@@ -782,7 +818,7 @@ impl Table {
                         self
                     }
 
-                    pub async fn execute(self, db: &::almostsql::ConnectionPool) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+                    pub async fn execute(self, db: &impl ::almostsql::Executor) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
                         let (sql, params) = self.0.to_sql()?;
                         let res = db.query_with_params(&sql, params).await?;
                         Ok(res.affected_rows())

@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::connection_pool::Backend;
+use crate::error::Error;
+use crate::pool::{Request, RequestQueue};
 
 /// Represents a SQL value of any supported type
 #[derive(Debug, Clone)]
@@ -19,10 +19,48 @@ pub enum Value {
     Uuid(Uuid),
 }
 
-/// Represents a row in a query result
+/// The column header of a result set: names plus a name → position index.
+/// Built once per statement execution and shared by every [`Row`] via `Arc`,
+/// so rows carry no per-row name allocations.
+#[derive(Debug)]
+pub struct Columns {
+    names: Vec<String>,
+    index: HashMap<String, usize>,
+}
+
+impl Columns {
+    pub fn new(names: Vec<String>) -> Self {
+        let index = names
+            .iter()
+            .enumerate()
+            .map(|(position, name)| (name.clone(), position))
+            .collect();
+        Self { names, index }
+    }
+
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    pub fn position(&self, name: &str) -> Option<usize> {
+        self.index.get(name).copied()
+    }
+}
+
+/// Represents a row in a query result. Values are stored positionally; the
+/// column header is shared across all rows of a result set.
 #[derive(Debug, Clone)]
 pub struct Row {
-    values: HashMap<String, Value>,
+    columns: Arc<Columns>,
+    values: Vec<Value>,
 }
 
 /// Represents the result of a SQL query
@@ -30,10 +68,6 @@ pub struct Row {
 pub struct QueryResult {
     rows: Vec<Row>,
     affected_rows: usize,
-}
-
-pub struct Transaction {
-    backend: Arc<Backend>,
 }
 
 impl fmt::Display for Value {
@@ -51,12 +85,42 @@ impl fmt::Display for Value {
 }
 
 impl Row {
-    pub fn new(values: HashMap<String, Value>) -> Self {
-        Self { values }
+    pub fn new(columns: Arc<Columns>, values: Vec<Value>) -> Self {
+        Self { columns, values }
+    }
+
+    /// Build a standalone row from name/value pairs. Intended for tests and
+    /// fixtures; real result rows share one [`Columns`] header per result set.
+    pub fn from_pairs<I: IntoIterator<Item = (String, Value)>>(pairs: I) -> Self {
+        let (names, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        Self {
+            columns: Arc::new(Columns::new(names)),
+            values,
+        }
+    }
+
+    pub fn columns(&self) -> &Arc<Columns> {
+        &self.columns
     }
 
     pub fn get(&self, column: &str) -> Option<&Value> {
-        self.values.get(column)
+        self.columns
+            .position(column)
+            .and_then(|position| self.values.get(position))
+    }
+
+    /// Positional access to a value.
+    pub fn get_index(&self, index: usize) -> Option<&Value> {
+        self.values.get(index)
+    }
+
+    /// Move a value out of the row, leaving `Null` behind. Lets callers
+    /// decode owned values (strings, blobs, vectors) without cloning.
+    pub fn take(&mut self, column: &str) -> Option<Value> {
+        self.columns
+            .position(column)
+            .and_then(|position| self.values.get_mut(position))
+            .map(|value| std::mem::replace(value, Value::Null))
     }
 
     pub fn get_int(&self, column: &str) -> Option<i64> {
@@ -95,7 +159,7 @@ impl Row {
     }
 
     pub fn column_names(&self) -> Vec<&String> {
-        self.values.keys().collect()
+        self.columns.names().iter().collect()
     }
 }
 
@@ -111,6 +175,12 @@ impl QueryResult {
         &self.rows
     }
 
+    /// Consume the result, yielding owned rows so values can be decoded
+    /// without cloning.
+    pub fn into_rows(self) -> Vec<Row> {
+        self.rows
+    }
+
     pub fn affected_rows(&self) -> usize {
         self.affected_rows
     }
@@ -124,28 +194,68 @@ impl QueryResult {
     }
 }
 
+/// A database transaction pinned to one checked-out connection.
+///
+/// Queries issued through the transaction run on that connection; queries
+/// issued through the [`ConnectionPool`](crate::ConnectionPool) while a
+/// transaction is open run on *other* connections and do not see uncommitted
+/// changes. Dropping the transaction without calling [`commit`](Self::commit)
+/// rolls it back.
+pub struct Transaction {
+    queue: RequestQueue,
+    finished: bool,
+}
+
 impl Transaction {
-    pub(crate) fn new(backend: Arc<Backend>) -> Self {
-        Self { backend }
+    pub(crate) fn new(queue: RequestQueue) -> Self {
+        Self {
+            queue,
+            finished: false,
+        }
     }
 
-    pub async fn commit(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
-        match &*self.backend {
-            #[cfg(feature = "postgres")]
-            Backend::Postgres(postgres) => postgres.commit_transaction().await,
-            #[cfg(feature = "sqlite")]
-            Backend::Sqlite(sqlite) => sqlite.commit_transaction().await,
-        }
+    /// Execute a raw SQL query on the transaction's connection.
+    pub async fn query(&self, query: &str) -> Result<QueryResult, Error> {
+        self.queue.query(Arc::from(query), Vec::new()).await
+    }
+
+    /// Execute a parameterized statement on the transaction's connection.
+    pub async fn query_with_params(
+        &self,
+        query: &str,
+        params: Vec<Value>,
+    ) -> Result<QueryResult, Error> {
+        self.queue.query(Arc::from(query), params).await
+    }
+
+    pub async fn commit(mut self) -> Result<(), Error> {
+        self.query("COMMIT;").await?;
+        self.finish();
+        Ok(())
+    }
+
+    pub async fn rollback(mut self) -> Result<(), Error> {
+        self.query("ROLLBACK;").await?;
+        self.finish();
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+        let _ = self.queue.sender().try_send(Request::Release);
     }
 }
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        match &*self.backend {
-            #[cfg(feature = "postgres")]
-            Backend::Postgres(postgres) => postgres.rollback_transaction_fire_and_forget(),
-            #[cfg(feature = "sqlite")]
-            Backend::Sqlite(sqlite) => sqlite.rollback_transaction_fire_and_forget(),
+        if !self.finished {
+            let (response, _) = futures::channel::oneshot::channel();
+            let _ = self.queue.sender().try_send(Request::Query {
+                sql: Arc::from("ROLLBACK;"),
+                params: Vec::new(),
+                response,
+            });
+            let _ = self.queue.sender().try_send(Request::Release);
         }
     }
 }
@@ -154,11 +264,17 @@ impl Drop for Transaction {
 // Decoding helpers
 // -----------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DecodeError(pub String);
 
 pub trait FromValue: Sized {
     fn from_value(v: &Value) -> Result<Self, DecodeError>;
+
+    /// Decode from an owned value. Types with owned storage (strings, blobs,
+    /// vectors) override this to move the data instead of cloning it.
+    fn from_owned_value(v: Value) -> Result<Self, DecodeError> {
+        Self::from_value(&v)
+    }
 }
 
 impl FromValue for i64 {
@@ -242,6 +358,14 @@ impl Row {
             .ok_or_else(|| DecodeError(format!("missing column '{}'", column)))
             .and_then(T::from_value)
     }
+
+    /// Decode a column by moving its value out of the row, avoiding a clone
+    /// for owned types. The column's slot is left as `Null`.
+    pub fn take_decode<T: FromValue>(&mut self, column: &str) -> Result<T, DecodeError> {
+        self.take(column)
+            .ok_or_else(|| DecodeError(format!("missing column '{}'", column)))
+            .and_then(T::from_owned_value)
+    }
 }
 
 impl<T: FromValue> FromValue for Option<T> {
@@ -249,6 +373,13 @@ impl<T: FromValue> FromValue for Option<T> {
         match v {
             Value::Null => Ok(None),
             _ => T::from_value(v).map(Some),
+        }
+    }
+
+    fn from_owned_value(v: Value) -> Result<Self, DecodeError> {
+        match v {
+            Value::Null => Ok(None),
+            _ => T::from_owned_value(v).map(Some),
         }
     }
 }
@@ -260,22 +391,31 @@ impl FromValue for String {
             other => Err(DecodeError(format!("expected TEXT, got {}", other))),
         }
     }
+
+    fn from_owned_value(v: Value) -> Result<Self, DecodeError> {
+        match v {
+            Value::Text(s) => Ok(s),
+            other => Err(DecodeError(format!("expected TEXT, got {}", other))),
+        }
+    }
 }
 
 impl<const DIM: u32> FromValue for crate::migration::FloatVec<DIM> {
     fn from_value(v: &Value) -> Result<Self, DecodeError> {
         match v {
             Value::FloatVector(v) => Ok(crate::migration::FloatVec::<DIM>(v.clone())),
-            Value::Blob(b) => {
-                if b.len() % 4 != 0 {
-                    return Err(DecodeError("FloatVec blob len not multiple of 4".into()));
-                }
-                let mut out = Vec::with_capacity(b.len() / 4);
-                for chunk in b.chunks_exact(4) {
-                    out.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                }
-                Ok(crate::migration::FloatVec::<DIM>(out))
-            }
+            Value::Blob(b) => float_vec_from_blob(b),
+            other => Err(DecodeError(format!(
+                "expected BLOB for FloatVec, got {}",
+                other
+            ))),
+        }
+    }
+
+    fn from_owned_value(v: Value) -> Result<Self, DecodeError> {
+        match v {
+            Value::FloatVector(v) => Ok(crate::migration::FloatVec::<DIM>(v)),
+            Value::Blob(b) => float_vec_from_blob(&b),
             other => Err(DecodeError(format!(
                 "expected BLOB for FloatVec, got {}",
                 other
@@ -284,10 +424,33 @@ impl<const DIM: u32> FromValue for crate::migration::FloatVec<DIM> {
     }
 }
 
+fn float_vec_from_blob<const DIM: u32>(
+    b: &[u8],
+) -> Result<crate::migration::FloatVec<DIM>, DecodeError> {
+    if !b.len().is_multiple_of(4) {
+        return Err(DecodeError("FloatVec blob len not multiple of 4".into()));
+    }
+    let mut out = Vec::with_capacity(b.len() / 4);
+    for chunk in b.chunks_exact(4) {
+        out.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(crate::migration::FloatVec::<DIM>(out))
+}
+
 impl<const DIM: u32> FromValue for crate::migration::BitVec<DIM> {
     fn from_value(v: &Value) -> Result<Self, DecodeError> {
         match v {
             Value::Blob(b) => Ok(crate::migration::BitVec::<DIM>(b.clone())),
+            other => Err(DecodeError(format!(
+                "expected BLOB for BitVec, got {}",
+                other
+            ))),
+        }
+    }
+
+    fn from_owned_value(v: Value) -> Result<Self, DecodeError> {
+        match v {
+            Value::Blob(b) => Ok(crate::migration::BitVec::<DIM>(b)),
             other => Err(DecodeError(format!(
                 "expected BLOB for BitVec, got {}",
                 other

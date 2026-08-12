@@ -10,7 +10,8 @@ async fn committed_transaction_persists_changes() {
         .expect("create table");
 
     let transaction = db.transaction().await.expect("begin");
-    db.query("INSERT INTO events (id) VALUES (1);")
+    transaction
+        .query("INSERT INTO events (id) VALUES (1);")
         .await
         .expect("insert");
     transaction.commit().await.expect("commit");
@@ -27,7 +28,8 @@ async fn dropped_transaction_rolls_back_changes() {
         .expect("create table");
 
     let transaction = db.transaction().await.expect("begin");
-    db.query("INSERT INTO events (id) VALUES (1);")
+    transaction
+        .query("INSERT INTO events (id) VALUES (1);")
         .await
         .expect("insert");
     drop(transaction);

@@ -575,7 +575,9 @@ use crate::query::{DecodeError, FromValue, Row as DbRow};
 pub trait SelectList<Tab> {
     type Out;
     fn names(&self, out: &mut Vec<&'static str>);
-    fn decode_row(row: &DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError>;
+    /// Decode a projection from a row. Takes the row mutably so owned values
+    /// (strings, blobs, vectors) can be moved out instead of cloned.
+    fn decode_row(row: &mut DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError>;
 }
 
 pub struct SelectCols<Tab, C: SelectList<Tab>> {
@@ -655,8 +657,8 @@ where
     fn names(&self, out: &mut Vec<&'static str>) {
         out.push(self.0.name)
     }
-    fn decode_row(row: &DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError> {
-        Ok((row.decode::<T1>(names[0])?,))
+    fn decode_row(row: &mut DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError> {
+        Ok((row.take_decode::<T1>(names[0])?,))
     }
 }
 
@@ -670,8 +672,11 @@ where
         out.push(self.0.name);
         out.push(self.1.name);
     }
-    fn decode_row(row: &DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError> {
-        Ok((row.decode::<T1>(names[0])?, row.decode::<T2>(names[1])?))
+    fn decode_row(row: &mut DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError> {
+        Ok((
+            row.take_decode::<T1>(names[0])?,
+            row.take_decode::<T2>(names[1])?,
+        ))
     }
 }
 
@@ -687,11 +692,11 @@ where
         out.push(self.1.name);
         out.push(self.2.name);
     }
-    fn decode_row(row: &DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError> {
+    fn decode_row(row: &mut DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError> {
         Ok((
-            row.decode::<T1>(names[0])?,
-            row.decode::<T2>(names[1])?,
-            row.decode::<T3>(names[2])?,
+            row.take_decode::<T1>(names[0])?,
+            row.take_decode::<T2>(names[1])?,
+            row.take_decode::<T3>(names[2])?,
         ))
     }
 }
@@ -716,12 +721,12 @@ where
         out.push(self.2.name);
         out.push(self.3.name);
     }
-    fn decode_row(row: &DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError> {
+    fn decode_row(row: &mut DbRow, names: &[&'static str]) -> Result<Self::Out, DecodeError> {
         Ok((
-            row.decode::<T1>(names[0])?,
-            row.decode::<T2>(names[1])?,
-            row.decode::<T3>(names[2])?,
-            row.decode::<T4>(names[3])?,
+            row.take_decode::<T1>(names[0])?,
+            row.take_decode::<T2>(names[1])?,
+            row.take_decode::<T3>(names[2])?,
+            row.take_decode::<T4>(names[3])?,
         ))
     }
 }
