@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::pool::{RequestQueue, RowStream};
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
 use crate::postgres::PostgresBackend;
 use crate::query::{QueryResult, Transaction, Value};
 use crate::sql_builder::SQLBuilder;
@@ -32,7 +32,7 @@ pub struct ConnectionPool {
 
 #[derive(Clone)]
 pub enum Backend {
-    #[cfg(feature = "postgres")]
+    #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
     Postgres(PostgresBackend),
     #[cfg(feature = "sqlite")]
     Sqlite(SqliteBackend),
@@ -53,11 +53,11 @@ impl ConnectionPool {
                 .into());
             }
         } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            #[cfg(feature = "postgres")]
+            #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
             {
                 Backend::Postgres(PostgresBackend::new(url)?)
             }
-            #[cfg(not(feature = "postgres"))]
+            #[cfg(not(any(feature = "postgres", feature = "postgres-tokio")))]
             {
                 return Err(format!(
                     "Postgres support is not enabled; rebuild with the \"postgres\" feature: {}",
@@ -274,7 +274,7 @@ impl ConnectionPool {
         validate_identifier(vector_column)?;
 
         match &*self.backend {
-            #[cfg(feature = "postgres")]
+            #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
             Backend::Postgres(_) => {
                 self.repair_postgres_legacy_vector_column(table, id_column, vector_column)
                     .await?;
@@ -291,7 +291,7 @@ impl ConnectionPool {
         self.repair_migration_hash(schema, migration_id).await
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
     async fn repair_postgres_legacy_vector_column(
         &self,
         table: &'static str,
@@ -476,7 +476,7 @@ impl PreparedQuery {
 impl Backend {
     pub(crate) fn builder(&self) -> SQLBuilder {
         match self {
-            #[cfg(feature = "postgres")]
+            #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
             Backend::Postgres(postgres) => postgres.builder(),
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(sqlite) => sqlite.builder(),
@@ -485,7 +485,7 @@ impl Backend {
 
     pub(crate) fn queue(&self) -> &RequestQueue {
         match self {
-            #[cfg(feature = "postgres")]
+            #[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
             Backend::Postgres(postgres) => postgres.queue(),
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(sqlite) => sqlite.queue(),
@@ -511,7 +511,7 @@ fn validate_identifier(identifier: &str) -> Result<(), Box<dyn StdError + Send +
     Ok(())
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
 fn legacy_float_vector(bytes: &[u8]) -> Result<Vec<f32>, Box<dyn StdError + Send + Sync>> {
     if !bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
         return Err("legacy vector blob length is not a multiple of 4".into());

@@ -19,7 +19,12 @@ categories = ["database"]
 [features]
 default = ["sqlite"]
 sqlite = ["dep:sqlite", "dep:sqlite-vec"]
+# Postgres via the synchronous `postgres` driver (no runtime dependency).
 postgres = ["dep:postgres"]
+# Postgres via `tokio-postgres`; each pooled connection runs on its own
+# current-thread Tokio runtime. Takes precedence over `postgres` when both
+# features are enabled.
+postgres-tokio = ["dep:tokio-postgres", "dep:tokio"]
 
 [dependencies]
 almostsql-macros = { version = "0.1.0", path = "almostsql-macros" }
@@ -30,6 +35,8 @@ postgres = { version = "0.19.12", features = ["with-uuid-1"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 sqlite = { version = "0.37.0", features = ["bundled"], optional = true }
 sqlite-vec = { version = "0.1.9", optional = true }
+tokio = { version = "1.52.1", default-features = false, features = ["rt", "net", "time"], optional = true }
+tokio-postgres = { version = "0.7.18", features = ["with-uuid-1"], optional = true }
 uuid = { version = "1.23.1", features = ["v4", "v7"] }
 
 [dev-dependencies]

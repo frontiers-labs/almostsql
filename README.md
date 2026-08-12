@@ -25,11 +25,21 @@ SQLite:
 almostsql = "0.1"
 ```
 
-Postgres:
+Postgres (synchronous `postgres` driver, no runtime dependency):
 
 ```toml
 [dependencies]
 almostsql = { version = "0.1", default-features = false, features = ["postgres"] }
+```
+
+Postgres via `tokio-postgres` (each pooled connection runs on its own
+current-thread Tokio runtime, so the public API is unchanged and callers do
+not need to be inside a Tokio runtime; takes precedence over `postgres` when
+both are enabled):
+
+```toml
+[dependencies]
+almostsql = { version = "0.1", default-features = false, features = ["postgres-tokio"] }
 ```
 
 ## Example

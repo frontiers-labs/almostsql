@@ -4,7 +4,7 @@ mod dsl;
 mod error;
 mod migration;
 mod pool;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "postgres-tokio"))]
 mod postgres;
 mod query;
 mod sql_builder;
