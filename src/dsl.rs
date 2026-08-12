@@ -337,6 +337,7 @@ impl<Tab> VectorSearch<Tab> {
 /// One position in a statement's parameter list: either a value fixed when
 /// the builder was constructed, or a hole (from a `*_param()` comparison) to
 /// be filled at execution time.
+#[derive(Clone)]
 pub(crate) enum ParamSlot {
     Fixed(Value),
     Hole,
@@ -573,6 +574,116 @@ impl<Tab> PreparedSelect<Tab> {
     }
 }
 
+/// A single-table INSERT builder that emits SQL and parameters. Columns are
+/// set either to fixed values or to bind parameters filled in when a
+/// prepared statement executes.
+pub struct Insert<Tab> {
+    table: &'static str,
+    cols: Vec<&'static str>,
+    slots: Vec<ParamSlot>,
+    _p: PhantomData<Tab>,
+}
+
+impl<Tab> Insert<Tab> {
+    pub fn new(table: &'static str) -> Self {
+        Self {
+            table,
+            cols: Vec::new(),
+            slots: Vec::new(),
+            _p: PhantomData,
+        }
+    }
+
+    pub fn set(mut self, column: &'static str, value: Value) -> Self {
+        self.cols.push(column);
+        self.slots.push(ParamSlot::Fixed(value));
+        self
+    }
+
+    /// Insert a column from a bind parameter supplied when the prepared
+    /// statement executes.
+    pub fn set_param(mut self, column: &'static str) -> Self {
+        self.cols.push(column);
+        self.slots.push(ParamSlot::Hole);
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cols.is_empty()
+    }
+
+    pub fn to_sql(&self) -> Result<(String, Vec<Value>), String> {
+        let (sql, slots) = self.to_sql_slots();
+        Ok((sql, fixed_values(slots)?))
+    }
+
+    pub(crate) fn to_sql_slots(&self) -> (String, Vec<ParamSlot>) {
+        let placeholders = std::iter::repeat_n("?", self.cols.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({});",
+            self.table,
+            self.cols.join(", "),
+            placeholders
+        );
+        (sql, self.slots.clone())
+    }
+
+    /// The column names and fixed values of this row, for batch insertion.
+    /// Errors when the row contains `set_param` holes.
+    pub(crate) fn into_row(self) -> Result<(Vec<&'static str>, Vec<Value>), String> {
+        let values = fixed_values(self.slots)?;
+        Ok((self.cols, values))
+    }
+
+    /// Precompile this statement. Columns added with
+    /// [`set_param`](Self::set_param) become bind parameters supplied at
+    /// execution time, in the order the columns were set.
+    pub async fn prepare(
+        &self,
+        db: &crate::ConnectionPool,
+    ) -> Result<PreparedExec<Tab>, crate::Error> {
+        if self.is_empty() {
+            return Err(crate::Error::InvalidQuery(
+                "INSERT with no columns cannot be prepared".into(),
+            ));
+        }
+        let (sql, slots) = self.to_sql_slots();
+        PreparedExec::prepare(db, &sql, slots).await
+    }
+}
+
+/// A precompiled, typed INSERT/UPDATE/DELETE. Execute with the values for
+/// the statement's parameter holes, in order of appearance; returns the
+/// number of affected rows.
+pub struct PreparedExec<Tab> {
+    inner: crate::connection_pool::PreparedStatement,
+    _p: PhantomData<Tab>,
+}
+
+impl<Tab> PreparedExec<Tab> {
+    pub(crate) async fn prepare(
+        db: &crate::ConnectionPool,
+        sql: &str,
+        slots: Vec<ParamSlot>,
+    ) -> Result<Self, crate::Error> {
+        let prepared = db.prepare(sql).await?;
+        Ok(Self {
+            inner: crate::connection_pool::PreparedStatement::new(prepared, slots),
+            _p: PhantomData,
+        })
+    }
+
+    pub fn sql(&self) -> &str {
+        self.inner.sql()
+    }
+
+    pub async fn execute(&self, args: Vec<Value>) -> Result<usize, crate::Error> {
+        Ok(self.inner.query(args).await?.affected_rows())
+    }
+}
+
 pub(crate) fn fixed_values(slots: Vec<ParamSlot>) -> Result<Vec<Value>, String> {
     let mut values = Vec::with_capacity(slots.len());
     for slot in slots {
@@ -596,7 +707,7 @@ pub(crate) fn fixed_values(slots: Vec<ParamSlot>) -> Result<Vec<Value>, String> 
 pub struct Update<Tab> {
     table: &'static str,
     set_cols: Vec<&'static str>,
-    set_vals: Vec<Value>,
+    set_slots: Vec<ParamSlot>,
     where_clause: Option<Expr<Tab>>,
     all: bool,
     _p: PhantomData<Tab>,
@@ -607,7 +718,7 @@ impl<Tab> Update<Tab> {
         Self {
             table,
             set_cols: Vec::new(),
-            set_vals: Vec::new(),
+            set_slots: Vec::new(),
             where_clause: None,
             all: false,
             _p: PhantomData,
@@ -616,7 +727,15 @@ impl<Tab> Update<Tab> {
 
     pub fn set(mut self, column: &'static str, value: Value) -> Self {
         self.set_cols.push(column);
-        self.set_vals.push(value);
+        self.set_slots.push(ParamSlot::Fixed(value));
+        self
+    }
+
+    /// SET a column from a bind parameter supplied when the prepared
+    /// statement executes.
+    pub fn set_param(mut self, column: &'static str) -> Self {
+        self.set_cols.push(column);
+        self.set_slots.push(ParamSlot::Hole);
         self
     }
 
@@ -635,6 +754,11 @@ impl<Tab> Update<Tab> {
     }
 
     pub fn to_sql(&self) -> Result<(String, Vec<Value>), String> {
+        let (sql, slots) = self.to_sql_slots()?;
+        Ok((sql, fixed_values(slots)?))
+    }
+
+    pub(crate) fn to_sql_slots(&self) -> Result<(String, Vec<ParamSlot>), String> {
         if self.where_clause.is_none() && !self.all {
             return Err("UPDATE without WHERE: call .where_(...) or .all() to confirm".into());
         }
@@ -649,12 +773,24 @@ impl<Tab> Update<Tab> {
             .collect::<Vec<_>>()
             .join(", ");
         sql.push_str(&assignments);
-        let mut params = self.set_vals.clone();
+        let mut slots = self.set_slots.clone();
         if let Some(expr) = &self.where_clause {
             sql.push_str(" WHERE ");
-            expr.to_sql_values(&mut sql, &mut params)?;
+            expr.to_sql(&mut sql, &mut slots);
         }
-        Ok((sql, params))
+        Ok((sql, slots))
+    }
+
+    /// Precompile this statement. SET values added with
+    /// [`set_param`](Self::set_param) and `*_param()` comparisons become bind
+    /// parameters supplied at execution time, in order of appearance (SET
+    /// values first, then the WHERE clause).
+    pub async fn prepare(
+        &self,
+        db: &crate::ConnectionPool,
+    ) -> Result<PreparedExec<Tab>, crate::Error> {
+        let (sql, slots) = self.to_sql_slots().map_err(crate::Error::InvalidQuery)?;
+        PreparedExec::prepare(db, &sql, slots).await
     }
 }
 
@@ -690,18 +826,33 @@ impl<Tab> Delete<Tab> {
     }
 
     pub fn to_sql(&self) -> Result<(String, Vec<Value>), String> {
+        let (sql, slots) = self.to_sql_slots()?;
+        Ok((sql, fixed_values(slots)?))
+    }
+
+    pub(crate) fn to_sql_slots(&self) -> Result<(String, Vec<ParamSlot>), String> {
         if self.where_clause.is_none() && !self.all {
             return Err("DELETE without WHERE: call .where_(...) or .all() to confirm".into());
         }
         let mut sql = String::new();
         sql.push_str("DELETE FROM ");
         sql.push_str(self.table);
-        let mut params = Vec::new();
+        let mut slots = Vec::new();
         if let Some(expr) = &self.where_clause {
             sql.push_str(" WHERE ");
-            expr.to_sql_values(&mut sql, &mut params)?;
+            expr.to_sql(&mut sql, &mut slots);
         }
-        Ok((sql, params))
+        Ok((sql, slots))
+    }
+
+    /// Precompile this statement; `*_param()` comparisons become bind
+    /// parameters supplied at execution time.
+    pub async fn prepare(
+        &self,
+        db: &crate::ConnectionPool,
+    ) -> Result<PreparedExec<Tab>, crate::Error> {
+        let (sql, slots) = self.to_sql_slots().map_err(crate::Error::InvalidQuery)?;
+        PreparedExec::prepare(db, &sql, slots).await
     }
 }
 
@@ -756,6 +907,11 @@ impl<Tab, C: SelectList<Tab>> SelectCols<Tab, C> {
     }
 
     pub fn to_sql(&self) -> Result<(String, Vec<Value>), String> {
+        let (sql, slots) = self.to_sql_slots();
+        Ok((sql, fixed_values(slots)?))
+    }
+
+    pub(crate) fn to_sql_slots(&self) -> (String, Vec<ParamSlot>) {
         let mut sql = String::new();
         sql.push_str("SELECT ");
         sql.push_str(&self.names.join(", "));
@@ -779,11 +935,57 @@ impl<Tab, C: SelectList<Tab>> SelectCols<Tab, C> {
             sql.push_str(" OFFSET ?");
             slots.push(ParamSlot::Fixed(Value::Integer(n as i64)));
         }
-        Ok((sql, fixed_values(slots)?))
+        (sql, slots)
     }
 
     pub fn names_slice(&self) -> &[&'static str] {
         &self.names
+    }
+
+    /// Precompile this projection. `*_param()` comparisons become bind
+    /// parameters supplied at execution time, in order of appearance.
+    pub async fn prepare(
+        &self,
+        db: &crate::ConnectionPool,
+    ) -> Result<PreparedSelectCols<Tab, C>, crate::Error> {
+        let (sql, slots) = self.to_sql_slots();
+        let prepared = db.prepare(&sql).await?;
+        Ok(PreparedSelectCols {
+            inner: crate::connection_pool::PreparedStatement::new(prepared, slots),
+            names: self.names.clone(),
+            _p: PhantomData,
+        })
+    }
+}
+
+/// A precompiled, typed projection SELECT. Execute with the values for the
+/// query's `*_param()` holes; rows decode into the projection's tuple type.
+pub struct PreparedSelectCols<Tab, C: SelectList<Tab>> {
+    inner: crate::connection_pool::PreparedStatement,
+    names: Vec<&'static str>,
+    _p: PhantomData<(Tab, C)>,
+}
+
+impl<Tab, C: SelectList<Tab>> PreparedSelectCols<Tab, C> {
+    pub fn sql(&self) -> &str {
+        self.inner.sql()
+    }
+
+    pub async fn all(&self, args: Vec<Value>) -> Result<Vec<C::Out>, crate::Error> {
+        let result = self.inner.query(args).await?;
+        let mut out = Vec::with_capacity(result.row_count());
+        for mut row in result.into_rows() {
+            out.push(C::decode_row(&mut row, &self.names)?);
+        }
+        Ok(out)
+    }
+
+    pub async fn one(&self, args: Vec<Value>) -> Result<C::Out, crate::Error> {
+        let mut rows = self.all(args).await?;
+        if rows.is_empty() {
+            return Err(crate::Error::InvalidQuery("query returned 0 rows".into()));
+        }
+        Ok(rows.swap_remove(0))
     }
 }
 

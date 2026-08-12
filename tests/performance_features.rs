@@ -258,3 +258,112 @@ async fn concurrent_queries_share_the_pool() {
         assert_eq!(count, 100 - i);
     }
 }
+
+#[tokio::test]
+async fn typed_prepared_insert_update_delete_round_trip() {
+    let db = pool_with_schema().await;
+
+    // Prepared INSERT: id and rank bound at execution, name fixed.
+    let insert = items::insert()
+        .id_param()
+        .name("prepared")
+        .rank_param()
+        .prepare(&db)
+        .await
+        .expect("prepare insert");
+    for i in 0..20_i64 {
+        let affected = insert
+            .execute(almostsql::params![Uuid::new_v4(), i])
+            .await
+            .expect("prepared insert");
+        assert_eq!(affected, 1);
+    }
+
+    // Prepared UPDATE: SET value and WHERE bound bind at execution
+    // (SET first, then WHERE).
+    let rename = items::update()
+        .name_param()
+        .where_(items::rank.lt_param())
+        .prepare(&db)
+        .await
+        .expect("prepare update");
+    let updated = rename
+        .execute(almostsql::params!["renamed", 5_i64])
+        .await
+        .expect("prepared update");
+    assert_eq!(updated, 5);
+
+    // Prepared projection SELECT decodes typed tuples.
+    let names = items::select_cols((items::name, items::rank))
+        .where_(items::rank.lt_param())
+        .order_by_asc(items::rank)
+        .prepare(&db)
+        .await
+        .expect("prepare projection");
+    let rows: Vec<(String, i64)> = names.all(almostsql::params![3_i64]).await.expect("project");
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter()
+            .all(|(name, rank)| name == "renamed" && *rank < 3)
+    );
+
+    // Prepared DELETE.
+    let purge = items::delete()
+        .where_(items::rank.ge_param())
+        .prepare(&db)
+        .await
+        .expect("prepare delete");
+    assert_eq!(
+        purge
+            .execute(almostsql::params![10_i64])
+            .await
+            .expect("delete"),
+        10
+    );
+    assert_eq!(
+        purge
+            .execute(almostsql::params![5_i64])
+            .await
+            .expect("delete"),
+        5
+    );
+
+    let count = db
+        .query("SELECT COUNT(*) AS n FROM items;")
+        .await
+        .expect("count");
+    assert_eq!(count.rows()[0].get_int("n"), Some(5));
+}
+
+#[tokio::test]
+async fn prepared_guardrails_hold() {
+    let db = pool_with_schema().await;
+
+    // UPDATE/DELETE still require WHERE (or all()) even when prepared.
+    assert!(items::update().name_param().prepare(&db).await.is_err());
+    assert!(items::delete().prepare(&db).await.is_err());
+
+    // Executing a builder with holes without preparing it is rejected.
+    assert!(
+        items::insert()
+            .id(Uuid::new_v4())
+            .name_param()
+            .rank(1_i64)
+            .execute(&db)
+            .await
+            .is_err()
+    );
+    assert!(
+        items::update()
+            .name_param()
+            .all()
+            .execute(&db)
+            .await
+            .is_err()
+    );
+
+    // Batch inserts must bind every value up front.
+    let batch =
+        items::insert_batch().add(items::insert().id(Uuid::new_v4()).name("x").rank_param());
+    assert!(batch.execute(&db).await.is_err());
+}

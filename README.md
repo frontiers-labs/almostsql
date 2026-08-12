@@ -100,16 +100,42 @@ let by_id = db.prepare("SELECT name FROM users WHERE id = ?").await?;
 let user = by_id.query(vec![Value::Uuid(id)]).await?;
 ```
 
-The typed select builder can be precompiled too: `*_param()` comparisons
-become bind parameters supplied at execution time (in order of appearance),
-and results decode into the table's typed rows:
+Every typed builder can be precompiled: `*_param()` methods mark values that
+bind at execution time (in order of appearance), and select results decode
+into the table's typed rows:
 
 ```rust,ignore
+// SELECT: *_param() comparisons become bind parameters.
 let adults_by_age = users::select()
     .where_(users::age.ge_param())
     .prepare(&db)
     .await?;
 let rows = adults_by_age.all(almostsql::params![18_i64]).await?;
+
+// INSERT: *_param() setters defer column values; fixed values stay baked in.
+let add_user = users::insert()
+    .id_param()
+    .name_param()
+    .age(0_i64)
+    .prepare(&db)
+    .await?;
+add_user.execute(almostsql::params![Uuid::new_v4(), "Ada"]).await?;
+
+// UPDATE and DELETE work the same way (SET values bind first, then WHERE),
+// and the WHERE-required safeguard still applies to prepared statements.
+let rename = users::update()
+    .name_param()
+    .where_(users::id.eq_param())
+    .prepare(&db)
+    .await?;
+rename.execute(almostsql::params!["Grace", id]).await?;
+
+// Projections decode into tuples.
+let names = users::select_cols((users::name, users::age))
+    .where_(users::age.ge_param())
+    .prepare(&db)
+    .await?;
+let rows: Vec<(String, i64)> = names.all(almostsql::params![18_i64]).await?;
 ```
 
 **Batched inserts.** `insert_batch` writes many rows per statement (chunked to

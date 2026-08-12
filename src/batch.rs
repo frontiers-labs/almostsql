@@ -68,6 +68,20 @@ impl BatchInsert {
         self.rows.push(values);
     }
 
+    /// Add one typed row built with an [`Insert`](crate::Insert) builder.
+    /// Rows containing `set_param` holes are rejected when the batch
+    /// executes — batches bind every value up front.
+    pub fn push_insert<Tab>(&mut self, insert: crate::Insert<Tab>) {
+        match insert.into_row() {
+            Ok((cols, values)) => self.push(&cols, values),
+            Err(message) => {
+                if self.error.is_none() {
+                    self.error = Some(Error::InvalidQuery(message));
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }

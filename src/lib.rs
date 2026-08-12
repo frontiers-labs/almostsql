@@ -16,8 +16,8 @@ pub use connection_pool::{
     ConnectionPool, Executor, Migrator, PreparedQuery, PreparedStatement, Transaction,
 };
 pub use dsl::{
-    Column, ColumnInput, Delete, Expr, IntoValue, PreparedSelect, Select, SelectCols, SelectList,
-    Update, VectorSearch, vector_search,
+    Column, ColumnInput, Delete, Expr, Insert, IntoValue, PreparedExec, PreparedSelect,
+    PreparedSelectCols, Select, SelectCols, SelectList, Update, VectorSearch, vector_search,
 };
 pub use error::Error;
 pub use migration::{

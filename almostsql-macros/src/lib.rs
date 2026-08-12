@@ -552,37 +552,53 @@ impl Table {
             })
             .collect();
 
-        // Insert builder setters per column
+        // Insert builder setters per column: a value setter and a `_param`
+        // setter that defers the value to prepared-statement execution.
         let insert_setters: Vec<proc_macro2::TokenStream> = self
             .columns
             .iter()
             .map(|c| {
                 let name_ident = &c.name;
-                let ty = &c.ty;
-                let db_name = c.column_name.clone().unwrap_or_else(|| c.name.to_string());
-                quote! {
-                    pub fn #name_ident<U: ::almostsql::ColumnInput<#ty>>(mut self, v: U) -> Self {
-                        self.cols.push(#db_name);
-                        let val = <U as ::almostsql::ColumnInput<#ty>>::into_value(v);
-                        self.params.push(val);
-                        self
-                    }
-                }
-            })
-            .collect();
-
-        // Update builder setters per column (SET column = value)
-        let update_setters: Vec<proc_macro2::TokenStream> = self
-            .columns
-            .iter()
-            .map(|c| {
-                let name_ident = &c.name;
+                let param_ident = quote::format_ident!("{}_param", name_ident);
                 let ty = &c.ty;
                 let db_name = c.column_name.clone().unwrap_or_else(|| c.name.to_string());
                 quote! {
                     pub fn #name_ident<U: ::almostsql::ColumnInput<#ty>>(mut self, v: U) -> Self {
                         let val = <U as ::almostsql::ColumnInput<#ty>>::into_value(v);
                         self.0 = self.0.set(#db_name, val);
+                        self
+                    }
+
+                    /// Bind this column when the prepared statement executes.
+                    pub fn #param_ident(mut self) -> Self {
+                        self.0 = self.0.set_param(#db_name);
+                        self
+                    }
+                }
+            })
+            .collect();
+
+        // Update builder setters per column (SET column = value), plus a
+        // `_param` setter that defers the value to prepared execution.
+        let update_setters: Vec<proc_macro2::TokenStream> = self
+            .columns
+            .iter()
+            .map(|c| {
+                let name_ident = &c.name;
+                let param_ident = quote::format_ident!("{}_param", name_ident);
+                let ty = &c.ty;
+                let db_name = c.column_name.clone().unwrap_or_else(|| c.name.to_string());
+                quote! {
+                    pub fn #name_ident<U: ::almostsql::ColumnInput<#ty>>(mut self, v: U) -> Self {
+                        let val = <U as ::almostsql::ColumnInput<#ty>>::into_value(v);
+                        self.0 = self.0.set(#db_name, val);
+                        self
+                    }
+
+                    /// SET this column from a bind parameter supplied when
+                    /// the prepared statement executes.
+                    pub fn #param_ident(mut self) -> Self {
+                        self.0 = self.0.set_param(#db_name);
                         self
                     }
                 }
@@ -730,38 +746,40 @@ impl Table {
                         let mut rows = self.limit(1).all(db).await?;
                         rows.pop().ok_or_else(|| "query returned 0 rows".into())
                     }
+
+                    /// Precompile this projection. `*_param()` comparisons
+                    /// become bind parameters supplied at execution time;
+                    /// rows decode into the projection's tuple type.
+                    pub async fn prepare(self, db: &::almostsql::ConnectionPool) -> Result<::almostsql::PreparedSelectCols<Table, C>, Box<dyn std::error::Error + Send + Sync>> {
+                        Ok(self.0.prepare(db).await?)
+                    }
                 }
 
                 /// Typed insert builder for this table
-                pub struct InsertBuilder {
-                    cols: Vec<&'static str>,
-                    params: Vec<::almostsql::Value>,
-                }
+                pub struct InsertBuilder(pub(crate) ::almostsql::Insert<Table>);
 
                 /// Start an INSERT builder for this table
                 pub fn insert() -> InsertBuilder {
-                    InsertBuilder { cols: Vec::new(), params: Vec::new() }
+                    InsertBuilder(::almostsql::Insert::new(TABLE_NAME))
                 }
 
                 impl InsertBuilder {
                     #(#insert_setters)*
 
                     pub async fn execute(self, db: &impl ::almostsql::Executor) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-                        if self.cols.is_empty() {
+                        if self.0.is_empty() {
                             return Ok(0);
                         }
-                        let placeholders = std::iter::repeat("?")
-                            .take(self.cols.len())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let sql = format!(
-                            "INSERT INTO {} ({}) VALUES ({});",
-                            TABLE_NAME,
-                            self.cols.join(", "),
-                            placeholders
-                        );
-                        let res = db.query_with_params(&sql, self.params).await?;
+                        let (sql, params) = self.0.to_sql()?;
+                        let res = db.query_with_params(&sql, params).await?;
                         Ok(res.affected_rows())
+                    }
+
+                    /// Precompile this INSERT. Columns set with the `*_param()`
+                    /// setters become bind parameters supplied at execution
+                    /// time, in the order the columns were set.
+                    pub async fn prepare(self, db: &::almostsql::ConnectionPool) -> Result<::almostsql::PreparedExec<Table>, Box<dyn std::error::Error + Send + Sync>> {
+                        Ok(self.0.prepare(db).await?)
                     }
                 }
 
@@ -777,9 +795,10 @@ impl Table {
 
                 impl BatchInsertBuilder {
                     /// Add one row built with [`insert()`]. All rows must set
-                    /// the same columns; a mismatch errors at execute time.
+                    /// the same columns; a mismatch (or a `*_param()` hole)
+                    /// errors at execute time.
                     pub fn add(mut self, row: InsertBuilder) -> Self {
-                        self.0.push(&row.cols, row.params);
+                        self.0.push_insert(row.0);
                         self
                     }
 
@@ -832,6 +851,14 @@ impl Table {
                         let res = db.query_with_params(&sql, params).await?;
                         Ok(res.affected_rows())
                     }
+
+                    /// Precompile this UPDATE. `*_param()` SET columns and
+                    /// comparisons become bind parameters supplied at
+                    /// execution time (SET values first, then the WHERE
+                    /// clause).
+                    pub async fn prepare(self, db: &::almostsql::ConnectionPool) -> Result<::almostsql::PreparedExec<Table>, Box<dyn std::error::Error + Send + Sync>> {
+                        Ok(self.0.prepare(db).await?)
+                    }
                 }
 
                 /// Typed DELETE builder for this table
@@ -859,6 +886,12 @@ impl Table {
                         let (sql, params) = self.0.to_sql()?;
                         let res = db.query_with_params(&sql, params).await?;
                         Ok(res.affected_rows())
+                    }
+
+                    /// Precompile this DELETE. `*_param()` comparisons become
+                    /// bind parameters supplied at execution time.
+                    pub async fn prepare(self, db: &::almostsql::ConnectionPool) -> Result<::almostsql::PreparedExec<Table>, Box<dyn std::error::Error + Send + Sync>> {
+                        Ok(self.0.prepare(db).await?)
                     }
                 }
             }
